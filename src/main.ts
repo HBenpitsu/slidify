@@ -10,6 +10,7 @@ import {
 	SlidesPreviewSettingTab,
 	type SlidesPreviewSettings,
 } from './settings';
+import { normalizeSlideLayoutKnobs } from './layoutParams';
 import {
 	SlidesPreviewView,
 	VIEW_TYPE_SLIDES_PREVIEW,
@@ -117,11 +118,20 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign(
+		const loaded = Object.assign(
 			{},
 			DEFAULT_SETTINGS,
 			(await this.loadData()) as Partial<SlidesPreviewSettings>,
 		);
+		const normalizedLayoutKnobs = normalizeSlideLayoutKnobs({
+			headerMarginEm: loaded.headerMarginEm,
+			paragraphMarginEm: loaded.paragraphMarginEm,
+			slidePaddingPx: loaded.slidePaddingPx,
+		});
+		this.settings = {
+			...loaded,
+			...normalizedLayoutKnobs,
+		};
 	}
 
 	async saveSettings() {

@@ -1,6 +1,10 @@
 import { Component, ItemView, MarkdownRenderer, TFile, WorkspaceLeaf } from 'obsidian';
 import SlidesLivePreviewPlugin from './main';
 import { findSlideIndexForLine, parseSlides, type SlideSegment } from './slideModel';
+import {
+	resolveSlideLayoutTuningParams,
+	type SlideLayoutTuningParams,
+} from './layoutParams';
 
 export const VIEW_TYPE_SLIDES_PREVIEW = 'slides-live-preview';
 
@@ -894,7 +898,7 @@ export class SlidesPreviewView extends ItemView {
 
 		if (args.mode === 'preview' && args.slideEl && args.overflowGuideEl) {
 			const idealHeight = Math.round(
-				args.slideEl.clientWidth / this.getViewportAspectRatio(),
+				args.slideEl.clientWidth / this.getTargetAspectRatio(),
 			);
 			const actualHeight = Math.ceil(
 				Math.max(idealHeight, geometry.scaledContentHeight + PREVIEW_OVERFLOW_SAFETY_PX),
@@ -1013,13 +1017,52 @@ export class SlidesPreviewView extends ItemView {
 		return this.normalizeContentScale(clampedPercent / 100);
 	}
 
+	private getLayoutTuningParams(): SlideLayoutTuningParams {
+		return resolveSlideLayoutTuningParams({
+			headerMarginEm: this.plugin.settings.headerMarginEm,
+			paragraphMarginEm: this.plugin.settings.paragraphMarginEm,
+			slidePaddingPx: this.plugin.settings.slidePaddingPx,
+		});
+	}
+
 	private getPresentationReferenceSize(): { width: number; height: number } {
-		const aspectRatio = this.getViewportAspectRatio();
+		const aspectRatio = this.getTargetAspectRatio();
 		const viewportWidth = Math.max(1, window.innerWidth);
 		const viewportHeight = Math.max(1, window.innerHeight - 80);
 		const width = Math.min(viewportWidth, viewportHeight * aspectRatio);
 		const height = width / aspectRatio;
 		return { width, height };
+	}
+
+	private getTargetAspectRatio(): number {
+		const monitorRatio = this.getMonitorAspectRatio();
+		if (monitorRatio !== null) {
+			return monitorRatio;
+		}
+
+		const viewportRatio = this.getViewportAspectRatio();
+		if (Number.isFinite(viewportRatio) && viewportRatio > 0) {
+			return viewportRatio;
+		}
+
+		return 16 / 9;
+	}
+
+	private getMonitorAspectRatio(): number | null {
+		const screenWidth = window.screen?.width;
+		const screenHeight = window.screen?.height;
+		if (
+			!Number.isFinite(screenWidth) ||
+			!Number.isFinite(screenHeight) ||
+			!screenWidth ||
+			!screenHeight ||
+			screenWidth <= 0 ||
+			screenHeight <= 0
+		) {
+			return null;
+		}
+
+		return screenWidth / screenHeight;
 	}
 
 	private getViewportAspectRatio(): number {
@@ -1029,9 +1072,30 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	private applyAspectRatioCssVar(): void {
+		const tuning = this.getLayoutTuningParams();
 		this.contentEl.style.setProperty(
 			'--slides-aspect-ratio',
-			String(this.getViewportAspectRatio()),
+			String(this.getTargetAspectRatio()),
+		);
+		this.contentEl.style.setProperty(
+			'--slides-heading-margin-bottom-em',
+			String(tuning.headerMarginBottomEm),
+		);
+		this.contentEl.style.setProperty(
+			'--slides-paragraph-margin-top-em',
+			String(tuning.paragraphMarginTopEm),
+		);
+		this.contentEl.style.setProperty(
+			'--slides-paragraph-margin-bottom-em',
+			String(tuning.paragraphMarginBottomEm),
+		);
+		this.contentEl.style.setProperty(
+			'--slides-preview-surface-padding-px',
+			`${tuning.previewSurfacePaddingPx}px`,
+		);
+		this.contentEl.style.setProperty(
+			'--slides-presentation-surface-padding-px',
+			`${tuning.presentationSurfacePaddingPx}px`,
 		);
 	}
 

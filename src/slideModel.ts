@@ -19,7 +19,7 @@ interface ParsedLeadingDirectives {
 }
 
 interface SlideDirectiveRule {
-	parse: (line: string) => number | null;
+	parse: (payload: string) => number | null;
 	apply: (value: number, directives: SlideDirectives) => void;
 }
 
@@ -27,22 +27,19 @@ const DEFAULT_SLIDE_DIRECTIVES: SlideDirectives = {
 	scaleMultiplier: 1,
 };
 
-const LEADING_DIRECTIVE_LINE_REGEX = /^%\s*(.*?)\s*%?\s*$/;
+const SCALE_DIRECTIVE_PAYLOAD_REGEX = /^(\d+(?:\.\d+)?)\s*%$/;
 
 const SLIDE_DIRECTIVE_RULES: SlideDirectiveRule[] = [
 	{
-		parse: (line) => {
-			const match = LEADING_DIRECTIVE_LINE_REGEX.exec(line.trim());
-			if (!match) {
+		parse: (payload) => {
+			const normalizedPayload = payload
+				.trim()
+				.replace(/\s+/g, ' ');
+			if (!normalizedPayload) {
 				return null;
 			}
 
-			const payload = match[1]?.trim();
-			if (!payload) {
-				return null;
-			}
-
-			const scaleMatch = /^(\d+(?:\.\d+)?)\s*%$/.exec(payload);
+			const scaleMatch = SCALE_DIRECTIVE_PAYLOAD_REGEX.exec(normalizedPayload);
 			if (!scaleMatch) {
 				return null;
 			}
@@ -160,12 +157,17 @@ function parseLeadingDirectives(content: string): ParsedLeadingDirectives {
 	let directiveStart = firstContentIndex;
 	let directiveEnd = directiveStart;
 	while (directiveEnd < lines.length) {
-		const line = lines[directiveEnd] ?? '';
-		if (!applyDirectiveLine(line, directives)) {
+		const parsedBlock = parseLeadingCommentBlock(lines, directiveEnd);
+		if (!parsedBlock) {
 			break;
 		}
 
-		directiveEnd += 1;
+		applyDirectivePayload(parsedBlock.payload, directives);
+		directiveEnd = parsedBlock.endLine + 1;
+
+		while (directiveEnd < lines.length && !lines[directiveEnd]?.trim()) {
+			directiveEnd += 1;
+		}
 	}
 
 	if (directiveEnd === directiveStart) {
@@ -186,13 +188,10 @@ function parseLeadingDirectives(content: string): ParsedLeadingDirectives {
 	};
 }
 
-function applyDirectiveLine(line: string, directives: SlideDirectives): boolean {
-	if (!LEADING_DIRECTIVE_LINE_REGEX.test(line.trim())) {
-		return false;
-	}
+function applyDirectivePayload(payload: string, directives: SlideDirectives): void {
 
 	for (const rule of SLIDE_DIRECTIVE_RULES) {
-		const parsedValue = rule.parse(line);
+		const parsedValue = rule.parse(payload);
 		if (parsedValue === null) {
 			continue;
 		}
@@ -200,8 +199,52 @@ function applyDirectiveLine(line: string, directives: SlideDirectives): boolean 
 		rule.apply(parsedValue, directives);
 		break;
 	}
+}
 
-	return true;
+function parseLeadingCommentBlock(
+	lines: string[],
+	startLine: number,
+): { payload: string; endLine: number } | null {
+	const startRawLine = lines[startLine];
+	if (startRawLine === undefined) {
+		return null;
+	}
+
+	const openIndex = startRawLine.indexOf('%%');
+	if (openIndex < 0) {
+		return null;
+	}
+
+	if (startRawLine.slice(0, openIndex).trim()) {
+		return null;
+	}
+
+	const afterOpen = startRawLine.slice(openIndex + 2);
+	const inlineCloseIndex = afterOpen.indexOf('%%');
+	if (inlineCloseIndex >= 0) {
+		const payload = afterOpen.slice(0, inlineCloseIndex);
+		return {
+			payload,
+			endLine: startLine,
+		};
+	}
+
+	const payloadLines: string[] = [afterOpen];
+	for (let lineIndex = startLine + 1; lineIndex < lines.length; lineIndex += 1) {
+		const line = lines[lineIndex] ?? '';
+		const closeIndex = line.indexOf('%%');
+		if (closeIndex >= 0) {
+			payloadLines.push(line.slice(0, closeIndex));
+			return {
+				payload: payloadLines.join('\n'),
+				endLine: lineIndex,
+			};
+		}
+
+		payloadLines.push(line);
+	}
+
+	return null;
 }
 
 function clampScaleMultiplier(multiplier: number): number {
