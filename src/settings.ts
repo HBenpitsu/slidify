@@ -29,6 +29,115 @@ export class SlidesPreviewSettingTab extends PluginSettingTab {
 		this.plugin = plugin;
 	}
 
+	getSettingDefinitions() {
+		return [
+			{
+				name: 'Slide separator',
+				desc: 'A line containing this value splits slides.',
+				control: {
+					type: 'text',
+					key: 'slideSeparator',
+					placeholder: '---',
+					validate: (value: string) =>
+						value.trim().length === 0 ? 'Slide separator cannot be empty.' : undefined,
+				},
+			},
+			{
+				name: 'Default content zoom (%)',
+				desc: 'Default slide content zoom used on open and reset.',
+				control: {
+					type: 'number',
+					key: 'defaultContentScalePercent',
+					min: 50,
+					max: 200,
+					step: 1,
+					placeholder: '100',
+				},
+			},
+			{
+				name: 'Header margin (em)',
+				desc: 'Bottom margin for headings in slide content.',
+				control: {
+					type: 'number',
+					key: 'headerMarginEm',
+					min: 0,
+					max: 2,
+					step: 0.01,
+				},
+			},
+			{
+				name: 'Paragraph margin (em)',
+				desc: 'Base paragraph margin used in slide content.',
+				control: {
+					type: 'number',
+					key: 'paragraphMarginEm',
+					min: 0,
+					max: 2,
+					step: 0.01,
+				},
+			},
+			{
+				name: 'Slide padding (px)',
+				desc: 'Padding for slide surfaces in preview and presentation.',
+				control: {
+					type: 'number',
+					key: 'slidePaddingPx',
+					min: 0,
+					max: 64,
+					step: 0.5,
+				},
+			},
+		];
+	}
+
+	getControlValue(key: string): unknown {
+		return this.plugin.settings[key as keyof SlidesPreviewSettings];
+	}
+
+	async setControlValue(key: string, value: unknown): Promise<void> {
+		const settings = this.plugin.settings;
+
+		switch (key) {
+			case 'slideSeparator': {
+				const nextValue = typeof value === 'string' ? value.trim() : '';
+				settings.slideSeparator = nextValue || DEFAULT_SETTINGS.slideSeparator;
+				break;
+			}
+
+			case 'defaultContentScalePercent': {
+				const nextValue = Number(value);
+				const normalized = Number.isFinite(nextValue)
+					? Math.round(Math.min(200, Math.max(50, nextValue)))
+					: DEFAULT_SETTINGS.defaultContentScalePercent;
+				settings.defaultContentScalePercent = normalized;
+				break;
+			}
+
+			case 'headerMarginEm':
+			case 'paragraphMarginEm':
+			case 'slidePaddingPx': {
+				const normalizedKnobs = normalizeSlideLayoutKnobs({
+					headerMarginEm:
+						key === 'headerMarginEm' ? Number(value) : settings.headerMarginEm,
+					paragraphMarginEm:
+						key === 'paragraphMarginEm' ? Number(value) : settings.paragraphMarginEm,
+					slidePaddingPx:
+						key === 'slidePaddingPx' ? Number(value) : settings.slidePaddingPx,
+				});
+				settings.headerMarginEm = normalizedKnobs.headerMarginEm;
+				settings.paragraphMarginEm = normalizedKnobs.paragraphMarginEm;
+				settings.slidePaddingPx = normalizedKnobs.slidePaddingPx;
+				break;
+			}
+
+			default:
+				return;
+		}
+
+		await this.plugin.saveSettings();
+		await this.plugin.refreshPreviewFromActiveContext();
+	}
+
 	display(): void {
 		const { containerEl } = this;
 
