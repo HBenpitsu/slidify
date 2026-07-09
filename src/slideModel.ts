@@ -6,7 +6,64 @@ export interface SlideSegment {
 	endLine: number;
 	layout: SlideLayout;
 	firstHeadingLevel: number | null;
+	scaleMultiplier: number;
 }
+
+interface SlideDirectives {
+	scaleMultiplier: number;
+}
+
+interface ParsedLeadingDirectives {
+	directives: SlideDirectives;
+	contentWithoutDirectives: string;
+}
+
+interface SlideDirectiveRule {
+	parse: (line: string) => number | null;
+	apply: (value: number, directives: SlideDirectives) => void;
+}
+
+const DEFAULT_SLIDE_DIRECTIVES: SlideDirectives = {
+	scaleMultiplier: 1,
+};
+
+const LEADING_DIRECTIVE_LINE_REGEX = /^%\s*(.*?)\s*%?\s*$/;
+
+const SLIDE_DIRECTIVE_RULES: SlideDirectiveRule[] = [
+	{
+		parse: (line) => {
+			const match = LEADING_DIRECTIVE_LINE_REGEX.exec(line.trim());
+			if (!match) {
+				return null;
+			}
+
+			const payload = match[1]?.trim();
+			if (!payload) {
+				return null;
+			}
+
+			const scaleMatch = /^(\d+(?:\.\d+)?)\s*%$/.exec(payload);
+			if (!scaleMatch) {
+				return null;
+			}
+
+			const percentToken = scaleMatch[1];
+			if (!percentToken) {
+				return null;
+			}
+
+			const parsedPercent = Number.parseFloat(percentToken);
+			if (!Number.isFinite(parsedPercent) || parsedPercent <= 0) {
+				return null;
+			}
+
+			return parsedPercent;
+		},
+		apply: (scalePercent, directives) => {
+			directives.scaleMultiplier = clampScaleMultiplier(scalePercent / 100);
+		},
+	},
+];
 
 export function parseSlides(markdown: string, separator: string): SlideSegment[] {
 	const { body, startLineOffset } = stripFrontmatter(markdown);
@@ -16,7 +73,14 @@ export function parseSlides(markdown: string, separator: string): SlideSegment[]
 	if (!trimmedSeparator) {
 		const content = body.trim();
 		return content
-			? [createSlideSegment(content, startLineOffset, startLineOffset + Math.max(lines.length - 1, 0))]
+			? [
+					createSlideSegment(
+						content,
+						startLineOffset,
+						startLineOffset + Math.max(lines.length - 1, 0),
+						DEFAULT_SLIDE_DIRECTIVES,
+					),
+				]
 			: [];
 	}
 
@@ -27,13 +91,15 @@ export function parseSlides(markdown: string, separator: string): SlideSegment[]
 
 	const pushSegment = (segmentEnd: number) => {
 		const rawContent = lines.slice(segmentStart, segmentEnd).join('\n');
-		const content = rawContent.trim();
+		const parsedDirectives = parseLeadingDirectives(rawContent);
+		const content = parsedDirectives.contentWithoutDirectives.trim();
 		if (content) {
 			slides.push(
 				createSlideSegment(
 					content,
 					startLineOffset + segmentStart,
 					startLineOffset + Math.max(segmentEnd - 1, segmentStart),
+					parsedDirectives.directives,
 				),
 			);
 		}
@@ -69,6 +135,7 @@ function createSlideSegment(
 	content: string,
 	startLine: number,
 	endLine: number,
+	directives: SlideDirectives,
 ): SlideSegment {
 	const firstHeadingLevel = detectFirstHeadingLevel(content);
 	return {
@@ -77,7 +144,72 @@ function createSlideSegment(
 		endLine,
 		firstHeadingLevel,
 		layout: classifySlideLayout(firstHeadingLevel),
+		scaleMultiplier: directives.scaleMultiplier,
 	};
+}
+
+function parseLeadingDirectives(content: string): ParsedLeadingDirectives {
+	const lines = content.split(/\r?\n/);
+	const directives: SlideDirectives = { ...DEFAULT_SLIDE_DIRECTIVES };
+
+	let firstContentIndex = 0;
+	while (firstContentIndex < lines.length && !lines[firstContentIndex]?.trim()) {
+		firstContentIndex += 1;
+	}
+
+	let directiveStart = firstContentIndex;
+	let directiveEnd = directiveStart;
+	while (directiveEnd < lines.length) {
+		const line = lines[directiveEnd] ?? '';
+		if (!applyDirectiveLine(line, directives)) {
+			break;
+		}
+
+		directiveEnd += 1;
+	}
+
+	if (directiveEnd === directiveStart) {
+		return {
+			directives,
+			contentWithoutDirectives: content,
+		};
+	}
+
+	const contentWithoutDirectives = [
+		...lines.slice(0, directiveStart),
+		...lines.slice(directiveEnd),
+	].join('\n');
+
+	return {
+		directives,
+		contentWithoutDirectives,
+	};
+}
+
+function applyDirectiveLine(line: string, directives: SlideDirectives): boolean {
+	if (!LEADING_DIRECTIVE_LINE_REGEX.test(line.trim())) {
+		return false;
+	}
+
+	for (const rule of SLIDE_DIRECTIVE_RULES) {
+		const parsedValue = rule.parse(line);
+		if (parsedValue === null) {
+			continue;
+		}
+
+		rule.apply(parsedValue, directives);
+		break;
+	}
+
+	return true;
+}
+
+function clampScaleMultiplier(multiplier: number): number {
+	if (!Number.isFinite(multiplier)) {
+		return DEFAULT_SLIDE_DIRECTIVES.scaleMultiplier;
+	}
+
+	return Math.min(4, Math.max(0.1, multiplier));
 }
 
 function detectFirstHeadingLevel(content: string): number | null {

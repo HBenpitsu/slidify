@@ -1,6 +1,6 @@
 {
 	"id": "obsidian-sample-plugin",
-	"name": "Slides Live Preview",
+	"name": "Slidify",
 	"version": "1.0.0",
 	"minAppVersion": "1.0.0",
 	"description": "Live slide preview and fullscreen presentation for Markdown notes.",

@@ -54,10 +54,6 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on('file-open', () => {
-				if (!this.settings.syncWithActiveFile) {
-					return;
-				}
-
 				void this.syncPreviewWithActiveContext();
 			}),
 		);
@@ -65,7 +61,7 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 		this.registerEvent(
 			this.app.workspace.on('editor-change', (editor, info) => {
 				const file = info.file;
-				if (!this.settings.syncWithActiveFile || !this.isMarkdownFile(file)) {
+				if (!this.isMarkdownFile(file)) {
 					return;
 				}
 
@@ -104,14 +100,7 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 		this.addSettingTab(new SlidesPreviewSettingTab(this.app, this));
 
 		this.app.workspace.onLayoutReady(() => {
-			if (this.settings.openPreviewOnStartup) {
-				void this.activatePreviewPane();
-				return;
-			}
-
-			if (this.settings.syncWithActiveFile) {
-				void this.syncPreviewWithActiveContext();
-			}
+			void this.syncPreviewWithActiveContext();
 		});
 	}
 
@@ -157,9 +146,7 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 	}
 
 	private createPreviewLeaf(): WorkspaceLeaf {
-		return this.settings.openInVerticalSplit
-			? this.app.workspace.getLeaf('split', 'vertical')
-			: this.app.workspace.getLeaf('split', 'horizontal');
+		return this.app.workspace.getLeaf('split', 'vertical');
 	}
 
 	private async syncPreviewWithActiveContext() {
@@ -197,10 +184,6 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 	}
 
 	private async syncCursorWithActiveContext() {
-		if (!this.settings.syncWithActiveFile) {
-			return;
-		}
-
 		const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (!this.isMarkdownFile(markdownView?.file)) {
 			return;

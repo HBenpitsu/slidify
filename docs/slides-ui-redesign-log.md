@@ -30,3 +30,13 @@
 - Removed the now-unused `contentEl` scale variable plumbing after the move to direct transform-based sizing.
 - Revalidated the cleanup refactor with `npm run build` and `npm run lint`; only the existing `getSettingDefinitions()` warning remains.
 - Final polish pass: replaced unstable nearest-edge preview scrolling with explicit clamped scrolling, stopped `Ctrl`+wheel from propagating to native scroll/zoom handlers, made presentation overflow hidden, and floated the control overlay with left/right docking.
+
+## 2026-07-09
+
+- Started implementation of the planned refactor for ratio, settings simplification, and directive extensibility.
+- Added reusable leading directive parsing in the slide model and introduced `% xxx% %` per-slide scale directives.
+- Updated heading/layout classification to run after stripping leading directive comment lines.
+- Reduced plugin settings to `slideSeparator` and `defaultContentScalePercent`; removed settings UI for sync/startup/split toggles.
+- Fixed plugin behavior to always sync with the active markdown context and always open new panes in a vertical split.
+- Switched stage/card aspect ratio behavior from fixed 16:9 to current window aspect ratio via a shared CSS variable.
+- Updated user-facing branding strings from Slides Live Preview to Slidify while keeping stable IDs for compatibility.

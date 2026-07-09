@@ -3,6 +3,7 @@
 	overflow: auto;
 	min-height: 100%;
 	background: var(--background-primary);
+	--slides-aspect-ratio: 1.7777777778;
 }
 
 .slides-live-preview-root {
@@ -145,7 +146,7 @@
 .slides-live-preview-slide-preview {
 	width: min(100%, 980px);
 	margin: 0 auto;
-	aspect-ratio: 16 / 9;
+	aspect-ratio: var(--slides-aspect-ratio);
 	border: 1px solid var(--background-modifier-border);
 	border-radius: 1.25rem;
 	padding: 0;
@@ -188,8 +189,8 @@
 }
 
 .slides-live-preview-presentation-surface {
-	width: min(100%, calc((100vh - 7.5rem) * 16 / 9));
-	aspect-ratio: 16 / 9;
+	width: min(100%, calc((100vh - 7.5rem) * var(--slides-aspect-ratio)));
+	aspect-ratio: var(--slides-aspect-ratio);
 	max-width: calc(100vw - 2rem);
 	height: 100%;
 	padding: clamp(1rem, 2vw, 2rem);
@@ -378,8 +379,8 @@
 }
 
 .slides-live-preview-view.is-presenting .slides-live-preview-presentation-surface {
-	width: min(100vw, calc(100vh * 16 / 9));
-	height: min(100vh, calc(100vw * 9 / 16));
+	width: min(100vw, calc(100vh * var(--slides-aspect-ratio)));
+	height: min(100vh, calc(100vw / var(--slides-aspect-ratio)));
 	max-width: 100vw;
 	max-height: 100vh;
 	padding: clamp(0.7rem, 1.2vw, 1.2rem);

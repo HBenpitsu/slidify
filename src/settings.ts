@@ -3,16 +3,12 @@ import SlidesLivePreviewPlugin from './main';
 
 export interface SlidesPreviewSettings {
 	slideSeparator: string;
-	syncWithActiveFile: boolean;
-	openPreviewOnStartup: boolean;
-	openInVerticalSplit: boolean;
+	defaultContentScalePercent: number;
 }
 
 export const DEFAULT_SETTINGS: SlidesPreviewSettings = {
 	slideSeparator: '---',
-	syncWithActiveFile: true,
-	openPreviewOnStartup: false,
-	openInVerticalSplit: true,
+	defaultContentScalePercent: 100,
 };
 
 export class SlidesPreviewSettingTab extends PluginSettingTab {
@@ -43,42 +39,20 @@ export class SlidesPreviewSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName('Sync with active file')
-			.setDesc('Keep preview focused on the file currently being edited.')
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.syncWithActiveFile)
-					.onChange(async (value) => {
-						this.plugin.settings.syncWithActiveFile = value;
-						await this.plugin.saveSettings();
-						if (value) {
-							await this.plugin.refreshPreviewFromActiveContext();
-						}
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName('Open preview when Obsidian starts')
-			.setDesc('Automatically open the slides live preview pane on launch.')
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.openPreviewOnStartup)
-					.onChange(async (value) => {
-						this.plugin.settings.openPreviewOnStartup = value;
-						await this.plugin.saveSettings();
-					}),
-			);
-
-		new Setting(containerEl)
-			.setName('Use vertical split')
-			.setDesc('Open the preview pane to the right instead of below.')
-			.addToggle((toggle) =>
-				toggle
-					.setValue(this.plugin.settings.openInVerticalSplit)
-					.onChange(async (value) => {
-						this.plugin.settings.openInVerticalSplit = value;
-						await this.plugin.saveSettings();
-					}),
-			);
+			.setName('Default content zoom (%)')
+			.setDesc('Default slide content zoom used on open and reset.')
+			.addText((text) => {
+				text.setPlaceholder('100');
+				text.setValue(String(this.plugin.settings.defaultContentScalePercent));
+				text.onChange(async (value) => {
+					const parsed = Number.parseInt(value.trim(), 10);
+					const normalized = Number.isFinite(parsed)
+						? Math.min(200, Math.max(50, parsed))
+						: DEFAULT_SETTINGS.defaultContentScalePercent;
+					this.plugin.settings.defaultContentScalePercent = normalized;
+					text.setValue(String(normalized));
+					await this.plugin.saveSettings();
+				});
+			});
 	}
 }

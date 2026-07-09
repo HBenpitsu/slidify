@@ -91,6 +91,7 @@ export class SlidesPreviewView extends ItemView {
 	constructor(leaf: WorkspaceLeaf, plugin: SlidesLivePreviewPlugin) {
 		super(leaf);
 		this.plugin = plugin;
+		this.contentScale = this.getDefaultContentScale();
 	}
 
 	getViewType(): string {
@@ -98,13 +99,14 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return 'Slides live preview';
+		return 'Slidify';
 	}
 
 	async onOpen(): Promise<void> {
 		this.contentEl.empty();
 		this.contentEl.addClass('slides-live-preview-view');
 		this.contentEl.tabIndex = 0;
+		this.applyAspectRatioCssVar();
 		this.registerInteractionHandlers();
 
 		this.slidesRootEl = this.contentEl.createDiv({ cls: 'slides-live-preview-root' });
@@ -172,6 +174,8 @@ export class SlidesPreviewView extends ItemView {
 		if (!this.slidesRootEl) {
 			return;
 		}
+
+		this.applyAspectRatioCssVar();
 
 		const currentVersion = ++this.renderVersion;
 		const previousScrollTop = this.contentEl.scrollTop;
@@ -391,13 +395,8 @@ export class SlidesPreviewView extends ItemView {
 		});
 		slideEl.toggleClass('is-active', slideIndex === this.currentSlideIndex);
 		slideEl.setAttribute('data-slide-index', String(slideIndex));
-		slideEl.addEventListener('click', (event) => {
-			const target = event.target;
-			if (target instanceof HTMLElement && target.closest('a, button, input, textarea, select')) {
-				return;
-			}
-
-			void this.goToSlide(slideIndex);
+		slideEl.addEventListener('mouseenter', () => {
+			this.selectSlideInPreview(slideIndex);
 		});
 
 		const overflowGuideEl = slideEl.createDiv({ cls: 'slides-live-preview-overflow-guide' });
@@ -501,8 +500,9 @@ export class SlidesPreviewView extends ItemView {
 		}
 
 		if (this.zoomResetButtonEl) {
+			const defaultScale = this.getDefaultContentScale();
 			this.zoomResetButtonEl.disabled =
-				Math.abs(this.contentScale - CONTENT_SCALE_DEFAULT) < 0.001;
+				Math.abs(this.contentScale - defaultScale) < 0.001;
 		}
 	}
 
@@ -739,8 +739,10 @@ export class SlidesPreviewView extends ItemView {
 		zoomFrameEl: HTMLDivElement;
 		zoomContentEl: HTMLDivElement;
 		slideContentEl: HTMLDivElement;
+		slide: SlideSegment;
 		mode: SlideRenderMode;
 	}): SlideLayoutMeasurements {
+		const viewportAspectRatio = this.getViewportAspectRatio();
 		const measuredWidth =
 			args.zoomFrameEl.clientWidth ||
 			args.zoomFrameEl.getBoundingClientRect().width ||
@@ -748,11 +750,12 @@ export class SlidesPreviewView extends ItemView {
 		const measuredHeight =
 			args.zoomFrameEl.clientHeight ||
 			args.zoomFrameEl.getBoundingClientRect().height ||
-			Math.round((measuredWidth * 9) / 16);
+			Math.round(measuredWidth / viewportAspectRatio);
 		const baseWidth = Math.max(1, Math.round(measuredWidth));
 		const baseHeight = Math.max(1, Math.round(measuredHeight));
 		const scaleNormalization = this.computeScaleNormalization(args.surfaceEl, baseWidth);
-		const effectiveScale = this.contentScale * scaleNormalization;
+		const effectiveScale =
+			this.contentScale * args.slide.scaleMultiplier * scaleNormalization;
 
 		args.zoomContentEl.style.width = `${baseWidth / effectiveScale}px`;
 		args.zoomContentEl.style.transform = `translateY(0px) scale(${effectiveScale})`;
@@ -780,7 +783,7 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	private computeScaleNormalization(surfaceEl: HTMLElement, baseWidth: number): number {
-		const referenceWidth = this.getPresentationReferenceWidth();
+		const { width: referenceWidth } = this.getPresentationReferenceSize();
 		if (referenceWidth <= 0) {
 			return 1;
 		}
@@ -864,6 +867,7 @@ export class SlidesPreviewView extends ItemView {
 			zoomFrameEl: args.zoomFrameEl,
 			zoomContentEl: args.zoomContentEl,
 			slideContentEl: args.slideContentEl,
+			slide: args.slide,
 			mode: args.mode,
 		});
 
@@ -889,7 +893,9 @@ export class SlidesPreviewView extends ItemView {
 		args.surfaceEl.style.height = `${geometry.surfaceHeight}px`;
 
 		if (args.mode === 'preview' && args.slideEl && args.overflowGuideEl) {
-			const idealHeight = Math.round((args.slideEl.clientWidth * 9) / 16);
+			const idealHeight = Math.round(
+				args.slideEl.clientWidth / this.getViewportAspectRatio(),
+			);
 			const actualHeight = Math.ceil(
 				Math.max(idealHeight, geometry.scaledContentHeight + PREVIEW_OVERFLOW_SAFETY_PX),
 			);
@@ -952,22 +958,81 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	private async resetContentScale(): Promise<void> {
-		if (Math.abs(this.contentScale - CONTENT_SCALE_DEFAULT) < 0.001) {
+		const defaultScale = this.getDefaultContentScale();
+		if (Math.abs(this.contentScale - defaultScale) < 0.001) {
 			return;
 		}
 
-		this.contentScale = CONTENT_SCALE_DEFAULT;
+		this.contentScale = defaultScale;
 		this.revealActiveSlideOnRefresh = true;
 		await this.refresh();
+	}
+
+	private selectSlideInPreview(nextIndex: number): void {
+		if (this.isPresenting() || nextIndex === this.currentSlideIndex || nextIndex < 0) {
+			return;
+		}
+
+		if (this.lastSlideCount > 0 && nextIndex >= this.lastSlideCount) {
+			return;
+		}
+
+		const stackEl = this.previewStackEl;
+		if (!stackEl) {
+			return;
+		}
+
+		const previousActiveEl = stackEl.querySelector(
+			`[data-slide-index="${this.currentSlideIndex}"]`,
+		);
+		const nextActiveEl = stackEl.querySelector(`[data-slide-index="${nextIndex}"]`);
+		if (!(nextActiveEl instanceof HTMLDivElement)) {
+			return;
+		}
+
+		if (previousActiveEl instanceof HTMLDivElement) {
+			previousActiveEl.removeClass('is-active');
+		}
+		nextActiveEl.addClass('is-active');
+		this.currentSlideIndex = nextIndex;
+		this.currentCursorLine = null;
+		this.updatePager(this.lastSlideCount);
 	}
 
 	private normalizeContentScale(scale: number): number {
 		return Number(Math.max(0.01, scale).toFixed(3));
 	}
 
-	private getPresentationReferenceWidth(): number {
-		const viewportHeight = window.innerHeight - 80;
-		return Math.min(window.innerWidth, viewportHeight * (16 / 9));
+	private getDefaultContentScale(): number {
+		const percent = this.plugin.settings.defaultContentScalePercent;
+		if (!Number.isFinite(percent)) {
+			return CONTENT_SCALE_DEFAULT;
+		}
+
+		const clampedPercent = Math.min(200, Math.max(50, percent));
+		return this.normalizeContentScale(clampedPercent / 100);
+	}
+
+	private getPresentationReferenceSize(): { width: number; height: number } {
+		const aspectRatio = this.getViewportAspectRatio();
+		const viewportWidth = Math.max(1, window.innerWidth);
+		const viewportHeight = Math.max(1, window.innerHeight - 80);
+		const width = Math.min(viewportWidth, viewportHeight * aspectRatio);
+		const height = width / aspectRatio;
+		return { width, height };
+	}
+
+	private getViewportAspectRatio(): number {
+		const width = Math.max(1, window.innerWidth);
+		const height = Math.max(1, window.innerHeight);
+		return width / height;
+	}
+
+	private applyAspectRatioCssVar(): void {
+		this.contentEl.style.setProperty(
+			'--slides-aspect-ratio',
+			String(this.getViewportAspectRatio()),
+		);
 	}
 
 	private setDockButtonIcon(): void {
