@@ -33,6 +33,18 @@
 - [x] Switch preview card surfaces to the document background color.
 - [x] Replace card resizing with shared content zoom and add `Ctrl`+wheel support.
 - [x] Show percentage zoom, remove zoom caps, restore preview overflow growth, and compensate preview scaling.
+- [x] Extract layout math from `slidesPreviewView.ts` into `src/slidesPreview/layoutEngine.ts`.
+- [x] Extract icon SVG creation into `src/slidesPreview/icons.ts`.
+- [x] Split mode-specific rendering orchestration into `src/slidesPreview/modeRenderers.ts`.
+- [x] Move interaction event wiring into `src/slidesPreview/interactionController.ts`.
+- [x] Extend `SlideSegment` to include metadata (`theme`, `speakerNotes`) and parse directives for them.
+
+## Follow-up backlog
+
+- [ ] Add visible UI for `speakerNotes` metadata in presentation mode.
+- [ ] Bind `theme` metadata to slide-level theme classes/variables.
+- [ ] Add lightweight performance instrumentation for refresh/render timings.
+- [ ] Revisit preview windowing only if measured decks show sustained performance issues.
 
 ## Validation
 

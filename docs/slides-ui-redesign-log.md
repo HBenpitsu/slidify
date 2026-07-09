@@ -40,3 +40,14 @@
 - Fixed plugin behavior to always sync with the active markdown context and always open new panes in a vertical split.
 - Switched stage/card aspect ratio behavior from fixed 16:9 to current window aspect ratio via a shared CSS variable.
 - Updated user-facing branding strings from Slides Live Preview to Slidify while keeping stable IDs for compatibility.
+- Refactored the view by extracting shared logic into dedicated modules while preserving rendering output quality:
+  - `src/slidesPreview/layoutEngine.ts` for measurement/geometry
+  - `src/slidesPreview/icons.ts` for SVG icon creation
+  - `src/slidesPreview/modeRenderers.ts` for preview/presentation mode orchestration
+  - `src/slidesPreview/interactionController.ts` for keyboard/wheel/fullscreen/resize bindings
+- Extended slide directives and model metadata in `src/slideModel.ts`:
+  - Added `theme:` and `note:` directive parsing.
+  - Added `metadata.theme` and `metadata.speakerNotes` to `SlideSegment`.
+- Kept As-Is visual parity by continuing to use `MarkdownRenderer` with Obsidian markdown preview classes in both modes.
+- Discussed preview windowing and deferred implementation for now due to variable-height slide cards and potential scroll jitter risks.
+- Revalidated after module split and metadata extension with `npm run build` and `npm run lint` passing.

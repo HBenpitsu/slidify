@@ -11,6 +11,10 @@ export interface SlidesPreviewSettings {
 	headerMarginEm: number;
 	paragraphMarginEm: number;
 	slidePaddingPx: number;
+	enablePeriodicRefresh: boolean;
+	periodicRefreshIntervalMs: number;
+	resizeSettleRefreshCount: number;
+	resizeSettleRefreshIntervalMs: number;
 }
 
 export const DEFAULT_SETTINGS: SlidesPreviewSettings = {
@@ -19,7 +23,17 @@ export const DEFAULT_SETTINGS: SlidesPreviewSettings = {
 	headerMarginEm: DEFAULT_SLIDE_LAYOUT_KNOBS.headerMarginEm,
 	paragraphMarginEm: DEFAULT_SLIDE_LAYOUT_KNOBS.paragraphMarginEm,
 	slidePaddingPx: DEFAULT_SLIDE_LAYOUT_KNOBS.slidePaddingPx,
+	enablePeriodicRefresh: true,
+	periodicRefreshIntervalMs: 900,
+	resizeSettleRefreshCount: 2,
+	resizeSettleRefreshIntervalMs: 140,
 };
+
+const PERIODIC_REFRESH_LIMITS = {
+	intervalMs: { min: 250, max: 5000 },
+	resizeSettleRefreshCount: { min: 0, max: 8 },
+	resizeSettleRefreshIntervalMs: { min: 40, max: 1200 },
+} as const;
 
 export class SlidesPreviewSettingTab extends PluginSettingTab {
 	plugin: SlidesLivePreviewPlugin;
@@ -87,6 +101,47 @@ export class SlidesPreviewSettingTab extends PluginSettingTab {
 					step: 0.5,
 				},
 			},
+			{
+				name: 'Enable periodic self-healing refresh',
+				desc: 'Runs periodic refresh to recover layout drift in non-active slides.',
+				control: {
+					type: 'toggle',
+					key: 'enablePeriodicRefresh',
+				},
+			},
+			{
+				name: 'Periodic refresh interval (ms)',
+				desc: 'Interval for periodic refresh scheduler.',
+				control: {
+					type: 'number',
+					key: 'periodicRefreshIntervalMs',
+					min: PERIODIC_REFRESH_LIMITS.intervalMs.min,
+					max: PERIODIC_REFRESH_LIMITS.intervalMs.max,
+					step: 10,
+				},
+			},
+			{
+				name: 'Resize settle refresh count',
+				desc: 'Follow-up refresh passes after resize/fullscreen changes.',
+				control: {
+					type: 'number',
+					key: 'resizeSettleRefreshCount',
+					min: PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.min,
+					max: PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.max,
+					step: 1,
+				},
+			},
+			{
+				name: 'Resize settle interval (ms)',
+				desc: 'Delay between follow-up refresh passes after viewport changes.',
+				control: {
+					type: 'number',
+					key: 'resizeSettleRefreshIntervalMs',
+					min: PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.min,
+					max: PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.max,
+					step: 10,
+				},
+			},
 		];
 	}
 
@@ -129,6 +184,41 @@ export class SlidesPreviewSettingTab extends PluginSettingTab {
 				settings.slidePaddingPx = normalizedKnobs.slidePaddingPx;
 				break;
 			}
+
+					case 'enablePeriodicRefresh': {
+						settings.enablePeriodicRefresh = Boolean(value);
+						break;
+					}
+
+					case 'periodicRefreshIntervalMs': {
+						settings.periodicRefreshIntervalMs = normalizeIntegerInRange(
+							Number(value),
+							DEFAULT_SETTINGS.periodicRefreshIntervalMs,
+							PERIODIC_REFRESH_LIMITS.intervalMs.min,
+							PERIODIC_REFRESH_LIMITS.intervalMs.max,
+						);
+						break;
+					}
+
+					case 'resizeSettleRefreshCount': {
+						settings.resizeSettleRefreshCount = normalizeIntegerInRange(
+							Number(value),
+							DEFAULT_SETTINGS.resizeSettleRefreshCount,
+							PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.min,
+							PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.max,
+						);
+						break;
+					}
+
+					case 'resizeSettleRefreshIntervalMs': {
+						settings.resizeSettleRefreshIntervalMs = normalizeIntegerInRange(
+							Number(value),
+							DEFAULT_SETTINGS.resizeSettleRefreshIntervalMs,
+							PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.min,
+							PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.max,
+						);
+						break;
+					}
 
 			default:
 				return;
@@ -233,5 +323,93 @@ export class SlidesPreviewSettingTab extends PluginSettingTab {
 					await this.plugin.refreshPreviewFromActiveContext();
 				});
 			});
+
+		new Setting(containerEl).setName('Advanced refresh').setHeading();
+
+		new Setting(containerEl)
+			.setName('Enable periodic self-healing refresh')
+			.setDesc('Runs periodic refresh to recover layout drift outside active slide updates.')
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.enablePeriodicRefresh)
+					.onChange(async (value) => {
+						this.plugin.settings.enablePeriodicRefresh = value;
+						await this.plugin.saveSettings();
+						await this.plugin.refreshPreviewFromActiveContext();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName('Periodic refresh interval (ms)')
+			.setDesc('Interval for periodic refresh scheduler.')
+			.addText((text) => {
+				text.setPlaceholder(String(DEFAULT_SETTINGS.periodicRefreshIntervalMs));
+				text.setValue(String(this.plugin.settings.periodicRefreshIntervalMs));
+				text.onChange(async (value) => {
+					const normalized = normalizeIntegerInRange(
+						Number.parseInt(value.trim(), 10),
+						DEFAULT_SETTINGS.periodicRefreshIntervalMs,
+						PERIODIC_REFRESH_LIMITS.intervalMs.min,
+						PERIODIC_REFRESH_LIMITS.intervalMs.max,
+					);
+					this.plugin.settings.periodicRefreshIntervalMs = normalized;
+					text.setValue(String(normalized));
+					await this.plugin.saveSettings();
+					await this.plugin.refreshPreviewFromActiveContext();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('Resize settle refresh count')
+			.setDesc('Extra refresh passes after resize/fullscreen to settle delayed layout shifts.')
+			.addText((text) => {
+				text.setPlaceholder(String(DEFAULT_SETTINGS.resizeSettleRefreshCount));
+				text.setValue(String(this.plugin.settings.resizeSettleRefreshCount));
+				text.onChange(async (value) => {
+					const normalized = normalizeIntegerInRange(
+						Number.parseInt(value.trim(), 10),
+						DEFAULT_SETTINGS.resizeSettleRefreshCount,
+						PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.min,
+						PERIODIC_REFRESH_LIMITS.resizeSettleRefreshCount.max,
+					);
+					this.plugin.settings.resizeSettleRefreshCount = normalized;
+					text.setValue(String(normalized));
+					await this.plugin.saveSettings();
+					await this.plugin.refreshPreviewFromActiveContext();
+				});
+			});
+
+		new Setting(containerEl)
+			.setName('Resize settle interval (ms)')
+			.setDesc('Delay between settle refresh passes.')
+			.addText((text) => {
+				text.setPlaceholder(String(DEFAULT_SETTINGS.resizeSettleRefreshIntervalMs));
+				text.setValue(String(this.plugin.settings.resizeSettleRefreshIntervalMs));
+				text.onChange(async (value) => {
+					const normalized = normalizeIntegerInRange(
+						Number.parseInt(value.trim(), 10),
+						DEFAULT_SETTINGS.resizeSettleRefreshIntervalMs,
+						PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.min,
+						PERIODIC_REFRESH_LIMITS.resizeSettleRefreshIntervalMs.max,
+					);
+					this.plugin.settings.resizeSettleRefreshIntervalMs = normalized;
+					text.setValue(String(normalized));
+					await this.plugin.saveSettings();
+					await this.plugin.refreshPreviewFromActiveContext();
+				});
+			});
 	}
+}
+
+function normalizeIntegerInRange(
+	value: number,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (!Number.isFinite(value)) {
+		return fallback;
+	}
+
+	return Math.min(max, Math.max(min, Math.round(value)));
 }

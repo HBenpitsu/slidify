@@ -1,6 +1,30 @@
-import { Component, ItemView, MarkdownRenderer, MarkdownView, TFile, WorkspaceLeaf } from 'obsidian';
+import {
+	Component,
+	ItemView,
+	MarkdownRenderer,
+	MarkdownView,
+	TFile,
+	type ViewStateResult,
+	WorkspaceLeaf,
+} from 'obsidian';
 import SlidesLivePreviewPlugin from './main';
 import { findSlideIndexForLine, parseSlides, type SlideSegment } from './slideModel';
+import {
+	createSlidesPreviewButtonIconSvg,
+	type SlidesPreviewIconName,
+} from './slidesPreview/icons';
+import { registerSlidesPreviewInteractionHandlers } from './slidesPreview/interactionController';
+import {
+	computeSlideLayoutGeometry,
+	measureSlideLayoutInputs,
+	type SlideRenderMode,
+} from './slidesPreview/layoutEngine';
+import {
+	renderPresentationMode,
+	renderPreviewSlidesMode,
+	type PreviewSlideElements,
+	type SlideSurfaceElements,
+} from './slidesPreview/modeRenderers';
 import {
 	resolveSlideLayoutTuningParams,
 	type SlideLayoutTuningParams,
@@ -13,53 +37,22 @@ const CONTENT_SCALE_DEFAULT = 1;
 const PREVIEW_OVERFLOW_SAFETY_PX = 12;
 const NON_ACTIVE_BATCH_REFRESH_MS = 420;
 const PREVIEW_RENDER_CHUNK_BUDGET_MS = 8;
+const PERIODIC_REFRESH_INTERVAL_FALLBACK_MS = 900;
+const PERIODIC_REFRESH_INTERVAL_MIN_MS = 250;
+const PERIODIC_REFRESH_INTERVAL_MAX_MS = 5000;
+const PERIODIC_ACTIVE_ONLY_FAILURE_THRESHOLD = 2;
+const RESIZE_SETTLE_RETRY_COUNT_MIN = 0;
+const RESIZE_SETTLE_RETRY_COUNT_MAX = 8;
+const RESIZE_SETTLE_INTERVAL_MIN_MS = 40;
+const RESIZE_SETTLE_INTERVAL_MAX_MS = 1200;
+const DEFAULT_RESIZE_SETTLE_INTERVAL_MS = 140;
+const PERSISTED_VIEW_STATE_SCHEMA_VERSION = 1;
 
-type IconName =
-	| 'previous'
-	| 'next'
-	| 'present'
-	| 'exit'
-	| 'dockLeft'
-	| 'dockRight'
-	| 'zoomOut'
-	| 'zoomIn'
-	| 'zoomReset';
-
-interface SlideSurfaceElements {
-	surfaceEl: HTMLDivElement;
-	zoomFrameEl: HTMLDivElement;
-	zoomContentEl: HTMLDivElement;
-	slideContentEl: HTMLDivElement;
-}
-
-interface PreviewSlideElements extends SlideSurfaceElements {
-	slideEl: HTMLDivElement;
-	overflowGuideEl: HTMLDivElement;
-}
-
-type SlideRenderMode = 'preview' | 'presentation';
-
-interface SlideLayoutGeometry {
-	mode: SlideRenderMode;
-	baseWidth: number;
-	baseHeight: number;
-	effectiveScale: number;
-	scaledContentHeight: number;
-	surfaceHeight: number;
-	translateOffsetPx: number;
-	bodyOffsetPx: number;
-}
-
-interface SlideLayoutMeasurements {
-	mode: SlideRenderMode;
-	baseWidth: number;
-	baseHeight: number;
-	effectiveScale: number;
-	scaleNormalization: number;
-	contentHeightUnscaled: number;
-	headingHeightUnscaled: number;
-	bodyHeightUnscaled: number;
-	sectionGapUnscaled: number;
+interface SlidesPreviewViewState {
+	schemaVersion: number;
+	targetFilePath: string | null;
+	currentSlideIndex: number;
+	contentScale: number;
 }
 
 export class SlidesPreviewView extends ItemView {
@@ -95,6 +88,13 @@ export class SlidesPreviewView extends ItemView {
 	private previewStackEl: HTMLDivElement | null = null;
 	private presentationStageEl: HTMLDivElement | null = null;
 	private pendingNonActiveBatchRefreshTimer: number | null = null;
+	private periodicRefreshTimer: number | null = null;
+	private pendingSettleRefreshTimers: number[] = [];
+	private pendingPeriodicFullRefresh = false;
+	private periodicViewportSnapshot = '';
+	private periodicActiveOnlyFailureStreak = 0;
+	private refreshInFlightCount = 0;
+	private pendingPersistedViewState: SlidesPreviewViewState | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: SlidesLivePreviewPlugin) {
 		super(leaf);
@@ -110,6 +110,41 @@ export class SlidesPreviewView extends ItemView {
 		return 'Slidify';
 	}
 
+	getState(): Record<string, unknown> {
+		return {
+			schemaVersion: PERSISTED_VIEW_STATE_SCHEMA_VERSION,
+			targetFilePath: this.targetFile?.path ?? null,
+			currentSlideIndex: Math.max(0, Math.floor(this.currentSlideIndex)),
+			contentScale: this.normalizeContentScale(this.contentScale),
+		};
+	}
+
+	async setState(state: unknown, result: ViewStateResult): Promise<void> {
+		await super.setState(state, result);
+		result.history = false;
+
+		const parsedState = this.parsePersistedViewState(state);
+		if (!parsedState) {
+			return;
+		}
+
+		if (!this.slidesRootEl) {
+			this.pendingPersistedViewState = parsedState;
+			return;
+		}
+
+		this.applyPersistedViewState(parsedState);
+		await this.refresh();
+	}
+
+	async onRename(file: TFile): Promise<void> {
+		if (this.targetFile !== file) {
+			return;
+		}
+
+		this.lastRenderedFilePath = file.path;
+	}
+
 	async onOpen(): Promise<void> {
 		this.contentEl.empty();
 		this.contentEl.addClass('slides-live-preview-view');
@@ -120,12 +155,20 @@ export class SlidesPreviewView extends ItemView {
 		this.slidesRootEl = this.contentEl.createDiv({ cls: 'slides-live-preview-root' });
 		this.ensureOverlay();
 		this.resetRenderComponent();
+		if (this.pendingPersistedViewState) {
+			this.applyPersistedViewState(this.pendingPersistedViewState);
+			this.pendingPersistedViewState = null;
+		}
 		this.observePaneSize();
+		this.periodicViewportSnapshot = this.getViewportSnapshot();
+		this.reconcilePeriodicRefreshScheduler();
 		await this.refresh();
 	}
 
 	async onClose(): Promise<void> {
 		this.cancelScheduledNonActiveBatchRefresh();
+		this.stopPeriodicRefreshScheduler();
+		this.cancelViewportSettleRefreshes();
 		this.teardownRenderComponent();
 		this.paneResizeObserver?.disconnect();
 		this.paneResizeObserver = null;
@@ -164,6 +207,7 @@ export class SlidesPreviewView extends ItemView {
 			);
 			if (updatedActiveOnly) {
 				this.scheduleNonActiveBatchRefresh();
+				this.reconcilePeriodicRefreshScheduler();
 				return;
 			}
 		}
@@ -176,11 +220,14 @@ export class SlidesPreviewView extends ItemView {
 			cursorLine !== null &&
 			this.tryApplyCursorOnlyUpdate(cursorLine)
 		) {
+			this.reconcilePeriodicRefreshScheduler();
 			return;
 		}
 
 		this.updateRevealState(cursorLine);
 		await this.refresh();
+		this.reconcilePeriodicRefreshScheduler();
+		this.scheduleWorkspaceLayoutSave();
 	}
 
 	isTargetFile(path: string): boolean {
@@ -212,66 +259,156 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	private async refresh(): Promise<void> {
-		if (!this.slidesRootEl) {
-			return;
-		}
-
-		this.applyAspectRatioCssVar();
-
-		const currentVersion = ++this.renderVersion;
-		const previousScrollTop = this.contentEl.scrollTop;
-		const shouldRevealActiveSlide = !this.isPresenting() && this.revealActiveSlideOnRefresh;
-		this.resetRenderComponent();
-
-		if (!this.targetFile) {
-			this.renderEmptyState('Open a Markdown note to preview slides.');
-			if (!shouldRevealActiveSlide) {
-				this.contentEl.scrollTop = previousScrollTop;
+		this.refreshInFlightCount += 1;
+		try {
+			if (!this.slidesRootEl) {
+				return;
 			}
-			return;
-		}
 
-		const markdown =
-			this.liveMarkdown ?? (await this.app.vault.cachedRead(this.targetFile));
-		if (currentVersion !== this.renderVersion) {
-			return;
-		}
+			this.applyAspectRatioCssVar();
 
-		const slides = parseSlides(markdown, this.plugin.settings.slideSeparator);
-		if (slides.length === 0) {
-			this.resetSlidesState();
-			this.renderEmptyState('No slide content found.');
-			if (!shouldRevealActiveSlide) {
-				this.contentEl.scrollTop = previousScrollTop;
+			const currentVersion = ++this.renderVersion;
+			const previousScrollTop = this.contentEl.scrollTop;
+			const shouldRevealActiveSlide = !this.isPresenting() && this.revealActiveSlideOnRefresh;
+			this.resetRenderComponent();
+
+			if (!this.targetFile) {
+				this.renderEmptyState('Open a Markdown note to preview slides.');
+				if (!shouldRevealActiveSlide) {
+					this.contentEl.scrollTop = previousScrollTop;
+				}
+				return;
 			}
-			return;
-		}
 
- 		this.syncActiveSlideIndex(slides);
-
-		const activeSlide = slides[this.currentSlideIndex];
-		if (!activeSlide) {
-			this.renderEmptyState('No slide content found.');
-			if (!shouldRevealActiveSlide) {
-				this.contentEl.scrollTop = previousScrollTop;
+			const markdown =
+				this.liveMarkdown ?? (await this.app.vault.cachedRead(this.targetFile));
+			if (currentVersion !== this.renderVersion) {
+				return;
 			}
-			return;
+
+			const slides = parseSlides(markdown, this.plugin.settings.slideSeparator);
+			if (slides.length === 0) {
+				this.resetSlidesState();
+				this.renderEmptyState('No slide content found.');
+				if (!shouldRevealActiveSlide) {
+					this.contentEl.scrollTop = previousScrollTop;
+				}
+				return;
+			}
+
+			this.syncActiveSlideIndex(slides);
+
+			const activeSlide = slides[this.currentSlideIndex];
+			if (!activeSlide) {
+				this.renderEmptyState('No slide content found.');
+				if (!shouldRevealActiveSlide) {
+					this.contentEl.scrollTop = previousScrollTop;
+				}
+				return;
+			}
+
+			const sourcePath = this.targetFile.path;
+			this.lastRenderedFilePath = sourcePath;
+			this.lastRenderedMarkdown = markdown;
+			this.lastRenderedSlides = slides;
+
+			if (this.isPresenting()) {
+				await this.renderPresentation(slides, activeSlide, sourcePath, currentVersion);
+			} else {
+				await this.renderPreviewSlides(
+					slides,
+					sourcePath,
+					currentVersion,
+					shouldRevealActiveSlide,
+					previousScrollTop,
+				);
+			}
+
+			if (currentVersion !== this.renderVersion) {
+				return;
+			}
+		} finally {
+			this.refreshInFlightCount = Math.max(0, this.refreshInFlightCount - 1);
+			this.reconcilePeriodicRefreshScheduler();
+		}
+	}
+
+	private parsePersistedViewState(state: unknown): SlidesPreviewViewState | null {
+		const payload = this.unwrapPersistedViewStatePayload(state);
+		if (!payload) {
+			return null;
 		}
 
-		const sourcePath = this.targetFile.path;
-		this.lastRenderedFilePath = sourcePath;
-		this.lastRenderedMarkdown = markdown;
-		this.lastRenderedSlides = slides;
-
-		if (this.isPresenting()) {
-			await this.renderPresentation(slides, activeSlide, sourcePath, currentVersion);
-		} else {
-			await this.renderPreviewSlides(slides, sourcePath, currentVersion, shouldRevealActiveSlide, previousScrollTop);
+		const schemaVersion =
+			typeof payload.schemaVersion === 'number' ? Math.floor(payload.schemaVersion) : 0;
+		if (schemaVersion > PERSISTED_VIEW_STATE_SCHEMA_VERSION) {
+			return null;
 		}
 
-		if (currentVersion !== this.renderVersion) {
-			return;
+		const targetFilePath =
+			typeof payload.targetFilePath === 'string' && payload.targetFilePath.length > 0
+				? payload.targetFilePath
+				: null;
+		const currentSlideIndex =
+			typeof payload.currentSlideIndex === 'number'
+				? Math.max(0, Math.floor(payload.currentSlideIndex))
+				: 0;
+		const contentScale =
+			typeof payload.contentScale === 'number'
+				? this.normalizeContentScale(payload.contentScale)
+				: this.getDefaultContentScale();
+
+		return {
+			schemaVersion,
+			targetFilePath,
+			currentSlideIndex,
+			contentScale,
+		};
+	}
+
+	private applyPersistedViewState(state: SlidesPreviewViewState): void {
+		this.contentScale = this.normalizeContentScale(state.contentScale);
+		this.currentSlideIndex = Math.max(0, Math.floor(state.currentSlideIndex));
+		this.currentCursorLine = null;
+		this.liveMarkdown = null;
+		this.revealActiveSlideOnRefresh = true;
+		this.lastRenderedMarkdown = null;
+		this.lastRenderedSlides = [];
+		this.lastSlideCount = 0;
+
+		const nextFile = state.targetFilePath
+			? this.resolveMarkdownFileByPath(state.targetFilePath)
+			: null;
+		this.targetFile = nextFile;
+		this.targetLeaf = null;
+		this.lastRenderedFilePath = nextFile?.path ?? null;
+		this.updatePager(0);
+		this.reconcilePeriodicRefreshScheduler();
+		this.scheduleWorkspaceLayoutSave();
+	}
+
+	private unwrapPersistedViewStatePayload(
+		state: unknown,
+	): Record<string, unknown> | null {
+		if (!isRecord(state)) {
+			return null;
 		}
+
+		const nestedState = state.state;
+		if (isRecord(nestedState)) {
+			return nestedState;
+		}
+
+		return state;
+	}
+
+	private resolveMarkdownFileByPath(path: string): TFile | null {
+		const abstractFile = this.app.vault.getAbstractFileByPath(path);
+		if (!(abstractFile instanceof TFile)) {
+			return null;
+		}
+
+		return this.isMarkdownFile(abstractFile) ? abstractFile : null;
 	}
 
 	private renderEmptyState(message: string): void {
@@ -300,83 +437,37 @@ export class SlidesPreviewView extends ItemView {
 			return;
 		}
 
-		if (this.presentationStageEl) {
-			this.presentationStageEl.remove();
-			this.presentationStageEl = null;
-		}
-
-		const stackEl = this.ensurePreviewStack();
-		const staleCards = Array.from(stackEl.children);
-		let activeSlideEl: HTMLDivElement | null = null;
-		let chunkStartTime = performance.now();
-
-		for (const [index, slide] of slides.entries()) {
-			if (currentVersion !== this.renderVersion) {
-				return;
-			}
-
-			if (performance.now() - chunkStartTime > PREVIEW_RENDER_CHUNK_BUDGET_MS) {
-				const canContinue = await this.waitForLayoutFrame(currentVersion);
-				if (!canContinue) {
+		await renderPreviewSlidesMode({
+			slides,
+			sourcePath,
+			currentVersion,
+			currentSlideIndex: this.currentSlideIndex,
+			shouldRevealActiveSlide,
+			previousScrollTop,
+			contentEl: this.contentEl,
+			renderChunkBudgetMs: PREVIEW_RENDER_CHUNK_BUDGET_MS,
+			getRenderVersion: () => this.renderVersion,
+			ensurePreviewStack: () => this.ensurePreviewStack(),
+			removePresentationStage: () => {
+				if (!this.presentationStageEl) {
 					return;
 				}
-				chunkStartTime = performance.now();
-			}
 
-			const slideSignature = this.computeSlideRenderSignature(slide);
-			const staleCard = staleCards[index];
-			const previewSlide = this.resolvePreviewSlideForRender({
-				index,
-				slide,
-				slideSignature,
-				stackEl,
-				staleCard,
-			});
-			const {
-				slideEl,
-				overflowGuideEl,
-				surfaceEl,
-				zoomFrameEl,
-				zoomContentEl,
-				slideContentEl,
-				needsMarkdownRender,
-			} = previewSlide;
-			if (needsMarkdownRender) {
-				await this.renderSlideMarkdown(slide, slideContentEl, sourcePath);
-			}
-			const laidOut = await this.resolveAndApplySlideLayout({
-				mode: 'preview',
-				slide,
-				surfaceEl,
-				zoomFrameEl,
-				zoomContentEl,
-				slideContentEl,
-				slideEl,
-				overflowGuideEl,
-				currentVersion,
-			});
-			if (!laidOut) {
-				return;
-			}
-
-			slideEl.toggleClass('is-active', index === this.currentSlideIndex);
-			this.updateSlideSourceMetadata(slideEl, slide);
-			if (index === this.currentSlideIndex) {
-				activeSlideEl = slideEl;
-			}
-		}
-
-		for (const staleCard of staleCards.slice(slides.length)) {
-			staleCard.remove();
-		}
-
-		this.renderOverlay(false, slides.length);
-		if (shouldRevealActiveSlide) {
-			this.revealActiveSlideInPreview(activeSlideEl, currentVersion);
-			return;
-		}
-
-		this.contentEl.scrollTop = previousScrollTop;
+				this.presentationStageEl.remove();
+				this.presentationStageEl = null;
+			},
+			waitForLayoutFrame: (version) => this.waitForLayoutFrame(version),
+			computeSlideRenderSignature: (slide) => this.computeSlideRenderSignature(slide),
+			resolvePreviewSlideForRender: (args) => this.resolvePreviewSlideForRender(args),
+			renderSlideMarkdown: (slide, slideContentEl, path) =>
+				this.renderSlideMarkdown(slide, slideContentEl, path),
+			resolveAndApplySlideLayout: (args) => this.resolveAndApplySlideLayout(args),
+			updateSlideSourceMetadata: (slideEl, slide) =>
+				this.updateSlideSourceMetadata(slideEl, slide),
+			renderOverlay: (isPresenting, slideCount) => this.renderOverlay(isPresenting, slideCount),
+			revealActiveSlideInPreview: (activeSlideEl, version) =>
+				this.revealActiveSlideInPreview(activeSlideEl, version),
+		});
 	}
 
 	private async renderPresentation(
@@ -389,51 +480,36 @@ export class SlidesPreviewView extends ItemView {
 			return;
 		}
 
-		if (this.previewStackEl) {
-			this.previewStackEl.remove();
-			this.previewStackEl = null;
-		}
-
-		for (const child of Array.from(this.slidesRootEl.children)) {
-			if (child !== this.presentationStageEl) {
-				child.remove();
-			}
-		}
-
-		const stageEl = this.presentationStageEl ?? this.slidesRootEl.createDiv({ cls: 'slides-live-preview-stage' });
-		this.presentationStageEl = stageEl;
-		stageEl.empty();
-		const { surfaceEl, zoomFrameEl, zoomContentEl, slideContentEl } =
-			this.createSlideSurface(stageEl, 'slides-live-preview-presentation-surface');
-		surfaceEl.addEventListener('click', (event: MouseEvent) => {
-			if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey) {
-				return;
-			}
-
-			event.preventDefault();
-			const sourceLine = this.resolveSourceLineFromPresentationClick(event.target, activeSlide);
-			void this.focusSourceEditorAtLine(sourceLine);
-		});
-		await this.renderSlideMarkdown(activeSlide, slideContentEl, sourcePath);
-		this.assignApproximateSourceLines(slideContentEl, activeSlide);
-		const laidOut = await this.resolveAndApplySlideLayout({
-			mode: 'presentation',
-			slide: activeSlide,
-			surfaceEl,
-			zoomFrameEl,
-			zoomContentEl,
-			slideContentEl,
+		await renderPresentationMode({
+			slides,
+			activeSlide,
+			sourcePath,
 			currentVersion,
+			getRenderVersion: () => this.renderVersion,
+			slidesRootEl: this.slidesRootEl,
+			presentationStageEl: this.presentationStageEl,
+			setPresentationStageEl: (stageEl) => {
+				this.presentationStageEl = stageEl;
+			},
+			removePreviewStack: () => {
+				if (!this.previewStackEl) {
+					return;
+				}
+
+				this.previewStackEl.remove();
+				this.previewStackEl = null;
+			},
+			createSlideSurface: (parentEl, cls) => this.createSlideSurface(parentEl, cls),
+			renderSlideMarkdown: (slide, slideContentEl, path) =>
+				this.renderSlideMarkdown(slide, slideContentEl, path),
+			assignApproximateSourceLines: (slideContentEl, slide) =>
+				this.assignApproximateSourceLines(slideContentEl, slide),
+			resolveAndApplySlideLayout: (args) => this.resolveAndApplySlideLayout(args),
+			resolveSourceLineFromPresentationClick: (target, slide) =>
+				this.resolveSourceLineFromPresentationClick(target, slide),
+			focusSourceEditorAtLine: (line) => this.focusSourceEditorAtLine(line),
+			renderOverlay: (isPresenting, slideCount) => this.renderOverlay(isPresenting, slideCount),
 		});
-		if (!laidOut) {
-			return;
-		}
-
-		if (currentVersion !== this.renderVersion) {
-			return;
-		}
-
-		this.renderOverlay(true, slides.length);
 	}
 
 	private ensurePreviewStack(): HTMLDivElement {
@@ -562,7 +638,9 @@ export class SlidesPreviewView extends ItemView {
 
 	private computeSlideRenderSignature(slide: SlideSegment): string {
 		const contentHash = this.hashString(slide.content);
-		return `${slide.layout}|${slide.scaleMultiplier}|${contentHash}`;
+		const notesHash = this.hashString(slide.metadata.speakerNotes.join('\n'));
+		const themeToken = slide.metadata.theme ?? '';
+		return `${slide.layout}|${slide.scaleMultiplier}|${themeToken}|${notesHash}|${contentHash}`;
 	}
 
 	private hashString(content: string): string {
@@ -583,6 +661,12 @@ export class SlidesPreviewView extends ItemView {
 	private updateSlideSourceMetadata(slideEl: HTMLDivElement, slide: SlideSegment): void {
 		slideEl.setAttribute('data-source-start-line', String(slide.startLine));
 		slideEl.setAttribute('data-source-end-line', String(slide.endLine));
+		slideEl.setAttribute('data-slide-notes-count', String(slide.metadata.speakerNotes.length));
+		if (slide.metadata.theme) {
+			slideEl.setAttribute('data-slide-theme', slide.metadata.theme);
+		} else {
+			slideEl.removeAttribute('data-slide-theme');
+		}
 
 		const slideContentEl = slideEl.querySelector<HTMLDivElement>(
 			'.slides-live-preview-slide-content',
@@ -629,6 +713,215 @@ export class SlidesPreviewView extends ItemView {
 			window.clearTimeout(this.pendingNonActiveBatchRefreshTimer);
 			this.pendingNonActiveBatchRefreshTimer = null;
 		}
+	}
+
+	private reconcilePeriodicRefreshScheduler(): void {
+		const shouldRun =
+			this.plugin.settings.enablePeriodicRefresh &&
+			!this.isPresenting() &&
+			Boolean(this.targetFile) &&
+			Boolean(this.slidesRootEl);
+		if (!shouldRun) {
+			this.stopPeriodicRefreshScheduler();
+			return;
+		}
+
+		if (this.periodicRefreshTimer !== null) {
+			return;
+		}
+
+		this.scheduleNextPeriodicRefreshTick();
+	}
+
+	private scheduleNextPeriodicRefreshTick(): void {
+		if (this.periodicRefreshTimer !== null) {
+			return;
+		}
+
+		const intervalMs = this.getPeriodicRefreshIntervalMs();
+		this.periodicRefreshTimer = window.setTimeout(() => {
+			this.periodicRefreshTimer = null;
+			void this.runPeriodicRefreshTick();
+		}, intervalMs);
+	}
+
+	private stopPeriodicRefreshScheduler(): void {
+		if (this.periodicRefreshTimer !== null) {
+			window.clearTimeout(this.periodicRefreshTimer);
+			this.periodicRefreshTimer = null;
+		}
+	}
+
+	private async runPeriodicRefreshTick(): Promise<void> {
+		if (
+			!this.plugin.settings.enablePeriodicRefresh ||
+			this.isPresenting() ||
+			!this.targetFile ||
+			!this.slidesRootEl
+		) {
+			this.stopPeriodicRefreshScheduler();
+			return;
+		}
+
+		if (this.refreshInFlightCount > 0) {
+			this.scheduleNextPeriodicRefreshTick();
+			return;
+		}
+
+		const viewportChanged = this.consumeViewportChangeSignal();
+		const shouldForceFullRefresh = this.pendingPeriodicFullRefresh || viewportChanged;
+		let updatedActiveOnly = false;
+
+		if (!shouldForceFullRefresh) {
+			updatedActiveOnly = await this.tryApplyActiveSlideRelayoutOnly();
+			if (updatedActiveOnly) {
+				this.periodicActiveOnlyFailureStreak = 0;
+			} else {
+				this.periodicActiveOnlyFailureStreak += 1;
+			}
+		}
+
+		const shouldEscalate =
+			shouldForceFullRefresh ||
+			(!updatedActiveOnly &&
+				this.periodicActiveOnlyFailureStreak >= PERIODIC_ACTIVE_ONLY_FAILURE_THRESHOLD);
+
+		if (shouldEscalate) {
+			this.pendingPeriodicFullRefresh = false;
+			this.periodicActiveOnlyFailureStreak = 0;
+			await this.refresh();
+			this.scheduleWorkspaceLayoutSave();
+		} else {
+			this.pendingPeriodicFullRefresh = false;
+		}
+
+		this.scheduleNextPeriodicRefreshTick();
+	}
+
+	private getPeriodicRefreshIntervalMs(): number {
+		const value = this.plugin.settings.periodicRefreshIntervalMs;
+		if (!Number.isFinite(value)) {
+			return PERIODIC_REFRESH_INTERVAL_FALLBACK_MS;
+		}
+
+		return Math.min(
+			PERIODIC_REFRESH_INTERVAL_MAX_MS,
+			Math.max(PERIODIC_REFRESH_INTERVAL_MIN_MS, Math.round(value)),
+		);
+	}
+
+	private getResizeSettleRefreshCount(): number {
+		const value = this.plugin.settings.resizeSettleRefreshCount;
+		if (!Number.isFinite(value)) {
+			return 0;
+		}
+
+		return Math.min(
+			RESIZE_SETTLE_RETRY_COUNT_MAX,
+			Math.max(RESIZE_SETTLE_RETRY_COUNT_MIN, Math.round(value)),
+		);
+	}
+
+	private getResizeSettleRefreshIntervalMs(): number {
+		const value = this.plugin.settings.resizeSettleRefreshIntervalMs;
+		if (!Number.isFinite(value)) {
+			return DEFAULT_RESIZE_SETTLE_INTERVAL_MS;
+		}
+
+		return Math.min(
+			RESIZE_SETTLE_INTERVAL_MAX_MS,
+			Math.max(RESIZE_SETTLE_INTERVAL_MIN_MS, Math.round(value)),
+		);
+	}
+
+	private markPeriodicFullRefreshNeeded(): void {
+		this.pendingPeriodicFullRefresh = true;
+	}
+
+	private scheduleViewportSettleRefreshes(): void {
+		this.cancelViewportSettleRefreshes();
+
+		const retryCount = this.getResizeSettleRefreshCount();
+		if (retryCount <= 0) {
+			return;
+		}
+
+		const intervalMs = this.getResizeSettleRefreshIntervalMs();
+		for (let retryIndex = 0; retryIndex < retryCount; retryIndex += 1) {
+			const timer = window.setTimeout(() => {
+				this.pendingSettleRefreshTimers = this.pendingSettleRefreshTimers.filter(
+					(activeTimer) => activeTimer !== timer,
+				);
+				this.markPeriodicFullRefreshNeeded();
+				void this.refresh();
+			}, intervalMs * (retryIndex + 1));
+			this.pendingSettleRefreshTimers.push(timer);
+		}
+	}
+
+	private cancelViewportSettleRefreshes(): void {
+		for (const timer of this.pendingSettleRefreshTimers) {
+			window.clearTimeout(timer);
+		}
+		this.pendingSettleRefreshTimers = [];
+	}
+
+	private getViewportSnapshot(): string {
+		return `${Math.round(window.innerWidth)}x${Math.round(window.innerHeight)}:${this.isPresenting() ? '1' : '0'}:${this.lastObservedPaneWidth}`;
+	}
+
+	private consumeViewportChangeSignal(): boolean {
+		const nextSnapshot = this.getViewportSnapshot();
+		if (!this.periodicViewportSnapshot) {
+			this.periodicViewportSnapshot = nextSnapshot;
+			return false;
+		}
+
+		const changed = this.periodicViewportSnapshot !== nextSnapshot;
+		this.periodicViewportSnapshot = nextSnapshot;
+		return changed;
+	}
+
+	private async tryApplyActiveSlideRelayoutOnly(): Promise<boolean> {
+		if (this.isPresenting() || !this.previewStackEl || this.lastRenderedSlides.length === 0) {
+			return false;
+		}
+
+		const activeSlide = this.lastRenderedSlides[this.currentSlideIndex];
+		if (!activeSlide) {
+			return false;
+		}
+
+		const activeSlideEl = this.previewStackEl.querySelector<HTMLDivElement>(
+			`[data-slide-index="${this.currentSlideIndex}"]`,
+		);
+		if (!activeSlideEl) {
+			return false;
+		}
+
+		const previewElements = this.getPreviewSlideElementsFromExisting(activeSlideEl);
+		if (!previewElements) {
+			return false;
+		}
+
+		const laidOut = await this.resolveAndApplySlideLayout({
+			mode: 'preview',
+			slide: activeSlide,
+			surfaceEl: previewElements.surfaceEl,
+			zoomFrameEl: previewElements.zoomFrameEl,
+			zoomContentEl: previewElements.zoomContentEl,
+			slideContentEl: previewElements.slideContentEl,
+			slideEl: previewElements.slideEl,
+			overflowGuideEl: previewElements.overflowGuideEl,
+			currentVersion: this.renderVersion,
+		});
+		if (!laidOut) {
+			return false;
+		}
+
+		this.updateSlideSourceMetadata(previewElements.slideEl, activeSlide);
+		this.updatePager(this.lastSlideCount);
+		return true;
 	}
 
 	private async tryApplyActiveSlideLiveUpdate(
@@ -691,6 +984,7 @@ export class SlidesPreviewView extends ItemView {
 		this.revealActiveSlideOnRefresh = true;
 		this.revealActiveSlideInPreview(previewElements.slideEl, this.renderVersion);
 		this.updatePager(slides.length);
+		this.scheduleWorkspaceLayoutSave();
 		return true;
 	}
 
@@ -882,6 +1176,7 @@ export class SlidesPreviewView extends ItemView {
 		this.currentCursorLine = null;
 		this.revealActiveSlideOnRefresh = !this.isPresenting();
 		await this.refresh();
+		this.scheduleWorkspaceLayoutSave();
 	}
 
 	private clearPagerState(): void {
@@ -939,6 +1234,7 @@ export class SlidesPreviewView extends ItemView {
 		this.revealActiveSlideOnRefresh = true;
 		this.updatePager(this.lastSlideCount);
 		this.revealActiveSlideInPreview(nextActiveEl, this.renderVersion);
+		this.scheduleWorkspaceLayoutSave();
 		return true;
 	}
 
@@ -952,64 +1248,41 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	private registerInteractionHandlers(): void {
-		this.registerDomEvent(this.contentEl, 'click', () => {
-			this.contentEl.focus();
-		});
+		registerSlidesPreviewInteractionHandlers({
+			contentEl: this.contentEl,
+			registerDomEvent: (target, type, handler) => {
+				if (target instanceof Window) {
+					this.registerDomEvent(target, type as keyof WindowEventMap, handler);
+					return;
+				}
 
-		this.registerDomEvent(this.contentEl, 'keydown', (event: KeyboardEvent) => {
-			if (event.key === 'ArrowRight' || event.key === 'PageDown') {
-				event.preventDefault();
-				void this.goToSlide(this.currentSlideIndex + 1);
-				return;
-			}
+				if (target instanceof Document) {
+					this.registerDomEvent(target, type as keyof DocumentEventMap, handler);
+					return;
+				}
 
-			if (event.key === 'ArrowLeft' || event.key === 'PageUp') {
-				event.preventDefault();
-				void this.goToSlide(this.currentSlideIndex - 1);
-				return;
-			}
-
-			if (event.key.toLowerCase() === 'f') {
-				event.preventDefault();
-				void this.togglePresentationMode();
-			}
-		});
-
-		this.registerDomEvent(this.contentEl, 'wheel', (event: WheelEvent) => {
-			if (event.ctrlKey) {
-				event.preventDefault();
-				event.stopPropagation();
-				void this.multiplyContentScale(
-					event.deltaY > 0 ? 1 / CONTENT_SCALE_FACTOR : CONTENT_SCALE_FACTOR,
-				);
-				return;
-			}
-
-			if (!this.isPresenting()) {
-				return;
-			}
-
-			const now = Date.now();
-			if (now < this.wheelNavigationLockUntil || Math.abs(event.deltaY) < 12) {
-				return;
-			}
-
-			event.preventDefault();
-			this.wheelNavigationLockUntil = now + 180;
-			void this.goToSlide(this.currentSlideIndex + (event.deltaY > 0 ? 1 : -1));
-		});
-
-		this.registerDomEvent(document, 'fullscreenchange', () => {
-			this.contentEl.classList.toggle(
-				'is-presenting',
-				document.fullscreenElement === this.contentEl,
-			);
-			this.revealActiveSlideOnRefresh = true;
-			void this.refresh();
-		});
-
-		this.registerDomEvent(window, 'resize', () => {
-			void this.refresh();
+				this.registerDomEvent(target, type as keyof HTMLElementEventMap, handler);
+			},
+			getCurrentSlideIndex: () => this.currentSlideIndex,
+			goToSlide: (nextIndex) => this.goToSlide(nextIndex),
+			togglePresentationMode: () => this.togglePresentationMode(),
+			multiplyContentScale: (multiplier) => this.multiplyContentScale(multiplier),
+			isPresenting: () => this.isPresenting(),
+			getWheelNavigationLockUntil: () => this.wheelNavigationLockUntil,
+			setWheelNavigationLockUntil: (lockUntil) => {
+				this.wheelNavigationLockUntil = lockUntil;
+			},
+			onFullscreenChanged: (isPresenting) => {
+				this.contentEl.classList.toggle('is-presenting', isPresenting);
+				this.revealActiveSlideOnRefresh = true;
+				this.reconcilePeriodicRefreshScheduler();
+			},
+			onViewportChanged: () => {
+				this.markPeriodicFullRefreshNeeded();
+				this.scheduleViewportSettleRefreshes();
+			},
+			refresh: () => this.refresh(),
+			contentScaleFactor: CONTENT_SCALE_FACTOR,
 		});
 	}
 
@@ -1027,6 +1300,8 @@ export class SlidesPreviewView extends ItemView {
 			}
 
 			this.lastObservedPaneWidth = nextWidth;
+			this.markPeriodicFullRefreshNeeded();
+			this.scheduleViewportSettleRefreshes();
 			void this.refresh();
 		});
 		this.paneResizeObserver.observe(this.contentEl);
@@ -1075,6 +1350,17 @@ export class SlidesPreviewView extends ItemView {
 			this.getRenderComponent(),
 		);
 		this.applySlideLayout(slideContentEl, slide);
+		this.applySlideMetadataAttributes(slideContentEl, slide);
+	}
+
+	private applySlideMetadataAttributes(targetEl: HTMLElement, slide: SlideSegment): void {
+		targetEl.setAttribute('data-slide-layout', slide.layout);
+		targetEl.setAttribute('data-slide-notes-count', String(slide.metadata.speakerNotes.length));
+		if (slide.metadata.theme) {
+			targetEl.setAttribute('data-slide-theme', slide.metadata.theme);
+		} else {
+			targetEl.removeAttribute('data-slide-theme');
+		}
 	}
 
 	private resolveSourceLineFromPresentationClick(
@@ -1116,118 +1402,6 @@ export class SlidesPreviewView extends ItemView {
 		return currentVersion === this.renderVersion;
 	}
 
-	private measureLayoutInputs(args: {
-		surfaceEl: HTMLDivElement;
-		zoomFrameEl: HTMLDivElement;
-		zoomContentEl: HTMLDivElement;
-		slideContentEl: HTMLDivElement;
-		slide: SlideSegment;
-		mode: SlideRenderMode;
-	}): SlideLayoutMeasurements {
-		const viewportAspectRatio = this.getViewportAspectRatio();
-		const measuredWidth =
-			args.zoomFrameEl.clientWidth ||
-			args.zoomFrameEl.getBoundingClientRect().width ||
-			args.surfaceEl.clientWidth;
-		const measuredHeight =
-			args.zoomFrameEl.clientHeight ||
-			args.zoomFrameEl.getBoundingClientRect().height ||
-			Math.round(measuredWidth / viewportAspectRatio);
-		const baseWidth = Math.max(1, Math.round(measuredWidth));
-		const baseHeight = Math.max(1, Math.round(measuredHeight));
-		const scaleNormalization = this.computeScaleNormalization(args.surfaceEl, baseWidth);
-		const effectiveScale =
-			this.contentScale * args.slide.scaleMultiplier * scaleNormalization;
-
-		args.zoomContentEl.style.width = `${baseWidth / effectiveScale}px`;
-		args.zoomContentEl.style.transform = `translateY(0px) scale(${effectiveScale})`;
-
-		const bodySlotEl = args.slideContentEl.querySelector<HTMLElement>(
-			'.slides-live-preview-body-slot',
-		);
-		const headingSlotEl = args.slideContentEl.querySelector<HTMLElement>(
-			'.slides-live-preview-heading-slot',
-		);
-		const slideContentStyle = window.getComputedStyle(args.slideContentEl);
-		const sectionGapUnscaled = this.parsePixelValue(slideContentStyle.rowGap);
-
-		return {
-			mode: args.mode,
-			baseWidth,
-			baseHeight,
-			effectiveScale,
-			scaleNormalization,
-			contentHeightUnscaled: args.zoomContentEl.scrollHeight,
-			headingHeightUnscaled: headingSlotEl?.offsetHeight ?? 0,
-			bodyHeightUnscaled: bodySlotEl?.scrollHeight ?? 0,
-			sectionGapUnscaled,
-		};
-	}
-
-	private computeScaleNormalization(surfaceEl: HTMLElement, baseWidth: number): number {
-		const { width: referenceWidth } = this.getPresentationReferenceSize();
-		if (referenceWidth <= 0) {
-			return 1;
-		}
-
-		const computedStyle = window.getComputedStyle(surfaceEl);
-		const horizontalPadding =
-			this.parsePixelValue(computedStyle.paddingLeft) +
-			this.parsePixelValue(computedStyle.paddingRight);
-		const usableWidth = Math.max(1, baseWidth - horizontalPadding);
-		const referenceUsableWidth = Math.max(1, referenceWidth - horizontalPadding);
-		return usableWidth / referenceUsableWidth;
-	}
-
-	private parsePixelValue(value: string): number {
-		const parsed = Number.parseFloat(value);
-		return Number.isFinite(parsed) ? parsed : 0;
-	}
-
-	private computeLayoutGeometry(
-		slide: SlideSegment,
-		measurements: SlideLayoutMeasurements,
-	): SlideLayoutGeometry {
-		const scaledContentHeight = measurements.contentHeightUnscaled * measurements.effectiveScale;
-		let translateOffsetPx = 0;
-		let bodyOffsetPx = 0;
-		let finalScaledHeight = scaledContentHeight;
-
-		if (slide.layout === 'section' && measurements.bodyHeightUnscaled > 0) {
-			const headingHeight = measurements.headingHeightUnscaled * measurements.effectiveScale;
-			const bodyHeight = measurements.bodyHeightUnscaled * measurements.effectiveScale;
-			const sectionGap = measurements.sectionGapUnscaled * measurements.effectiveScale;
-
-			// 1) Center body as if heading did not exist.
-			const centeredBodyTop = (measurements.baseHeight - bodyHeight) / 2;
-
-			// 2) If that overlaps heading(+gap), push body down just enough.
-			const headingBottom = headingHeight + sectionGap;
-			const targetBodyTop = Math.max(centeredBodyTop, headingBottom);
-			bodyOffsetPx = Math.max(0, targetBodyTop - headingBottom);
-			finalScaledHeight += bodyOffsetPx;
-		} else {
-			const remainingHeight = measurements.baseHeight - scaledContentHeight;
-			translateOffsetPx = Math.max(0, remainingHeight / 2);
-		}
-		const surfaceHeight =
-			measurements.mode === 'preview'
-				? Math.max(measurements.baseHeight, finalScaledHeight)
-				: measurements.baseHeight;
-		void slide;
-
-		return {
-			mode: measurements.mode,
-			baseWidth: measurements.baseWidth,
-			baseHeight: measurements.baseHeight,
-			effectiveScale: measurements.effectiveScale,
-			scaledContentHeight: finalScaledHeight,
-			surfaceHeight,
-			translateOffsetPx,
-			bodyOffsetPx,
-		};
-	}
-
 	private async resolveAndApplySlideLayout(args: {
 		mode: SlideRenderMode;
 		slide: SlideSegment;
@@ -1244,16 +1418,20 @@ export class SlidesPreviewView extends ItemView {
 			return false;
 		}
 
-		const measurements = this.measureLayoutInputs({
+		const { width: presentationReferenceWidth } = this.getPresentationReferenceSize();
+		const measurements = measureSlideLayoutInputs({
 			surfaceEl: args.surfaceEl,
 			zoomFrameEl: args.zoomFrameEl,
 			zoomContentEl: args.zoomContentEl,
 			slideContentEl: args.slideContentEl,
 			slide: args.slide,
 			mode: args.mode,
+			contentScale: this.contentScale,
+			presentationReferenceWidth,
+			viewportAspectRatio: this.getViewportAspectRatio(),
 		});
 
-		const geometry = this.computeLayoutGeometry(
+		const geometry = computeSlideLayoutGeometry(
 			args.slide,
 			measurements,
 		);
@@ -1337,6 +1515,7 @@ export class SlidesPreviewView extends ItemView {
 		this.contentScale = nextScale;
 		this.revealActiveSlideOnRefresh = true;
 		await this.refresh();
+		this.scheduleWorkspaceLayoutSave();
 	}
 
 	private async resetContentScale(): Promise<void> {
@@ -1348,6 +1527,7 @@ export class SlidesPreviewView extends ItemView {
 		this.contentScale = defaultScale;
 		this.revealActiveSlideOnRefresh = true;
 		await this.refresh();
+		this.scheduleWorkspaceLayoutSave();
 	}
 
 	private selectSlideInPreview(nextIndex: number): void {
@@ -1379,6 +1559,11 @@ export class SlidesPreviewView extends ItemView {
 		this.currentSlideIndex = nextIndex;
 		this.currentCursorLine = null;
 		this.updatePager(this.lastSlideCount);
+		this.scheduleWorkspaceLayoutSave();
+	}
+
+	private scheduleWorkspaceLayoutSave(): void {
+		void this.app.workspace.requestSaveLayout();
 	}
 
 	private normalizeContentScale(scale: number): number {
@@ -1502,7 +1687,7 @@ export class SlidesPreviewView extends ItemView {
 
 	private createIconButton(
 		parentEl: HTMLElement,
-		icon: IconName,
+		icon: SlidesPreviewIconName,
 		label: string,
 		cls = 'slides-live-preview-nav-button',
 	): HTMLButtonElement {
@@ -1559,45 +1744,13 @@ export class SlidesPreviewView extends ItemView {
 
 	private setButtonIcon(
 		buttonEl: HTMLButtonElement,
-		icon: IconName,
+		icon: SlidesPreviewIconName,
 		label: string,
 	): void {
 		buttonEl.empty();
 		buttonEl.setAttribute('aria-label', label);
 		buttonEl.setAttribute('title', label);
-		buttonEl.appendChild(this.createButtonIconSvg(icon));
-	}
-
-	private createButtonIconSvg(
-		icon: IconName,
-	): SVGSVGElement {
-		const iconPaths = {
-			previous: 'M14.5 5.5 8 12l6.5 6.5',
-			next: 'M9.5 5.5 16 12l-6.5 6.5',
-			present: 'M8 4.5H4.5V8M16 4.5h3.5V8M8 19.5H4.5V16M16 19.5h3.5V16',
-			exit: 'M8 8H4.5V4.5M16 8h3.5V4.5M8 16H4.5v3.5M16 16h3.5v3.5',
-			dockLeft: 'M8 6.5v11M12 6.5v11M16 6.5v11M5.5 6.5h13',
-			dockRight: 'M16 6.5v11M12 6.5v11M8 6.5v11M5.5 6.5h13',
-			zoomOut: 'M7 12h10M12 5.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z',
-			zoomIn: 'M7 12h10M12 7v10M12 5.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z',
-			zoomReset: 'M7.5 9.5h9M7.5 14.5h9M12 5.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13Z',
-		};
-		const namespace = 'http://www.w3.org/2000/svg';
-		const svgEl = document.createElementNS(namespace, 'svg');
-		svgEl.setAttribute('class', 'slides-live-preview-button-icon');
-		svgEl.setAttribute('viewBox', '0 0 24 24');
-		svgEl.setAttribute('aria-hidden', 'true');
-
-		const pathEl = document.createElementNS(namespace, 'path');
-		pathEl.setAttribute('d', iconPaths[icon]);
-		pathEl.setAttribute('fill', 'none');
-		pathEl.setAttribute('stroke', 'currentColor');
-		pathEl.setAttribute('stroke-linecap', 'round');
-		pathEl.setAttribute('stroke-linejoin', 'round');
-		pathEl.setAttribute('stroke-width', '1.8');
-		svgEl.appendChild(pathEl);
-
-		return svgEl;
+		buttonEl.appendChild(createSlidesPreviewButtonIconSvg(icon));
 	}
 
 	private isPresenting(): boolean {
@@ -1628,4 +1781,8 @@ export class SlidesPreviewView extends ItemView {
 	private isMarkdownFile(file: TFile | null): file is TFile {
 		return Boolean(file && file.extension === 'md');
 	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }

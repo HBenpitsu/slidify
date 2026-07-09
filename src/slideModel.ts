@@ -1,5 +1,10 @@
 export type SlideLayout = 'hero' | 'section' | 'content';
 
+export interface SlideMetadata {
+	theme: string | null;
+	speakerNotes: string[];
+}
+
 export interface SlideSegment {
 	content: string;
 	startLine: number;
@@ -7,10 +12,13 @@ export interface SlideSegment {
 	layout: SlideLayout;
 	firstHeadingLevel: number | null;
 	scaleMultiplier: number;
+	metadata: SlideMetadata;
 }
 
 interface SlideDirectives {
 	scaleMultiplier: number;
+	theme: string | null;
+	speakerNotes: string[];
 }
 
 interface ParsedLeadingDirectives {
@@ -18,49 +26,13 @@ interface ParsedLeadingDirectives {
 	contentWithoutDirectives: string;
 }
 
-interface SlideDirectiveRule {
-	parse: (payload: string) => number | null;
-	apply: (value: number, directives: SlideDirectives) => void;
-}
-
 const DEFAULT_SLIDE_DIRECTIVES: SlideDirectives = {
 	scaleMultiplier: 1,
+	theme: null,
+	speakerNotes: [],
 };
 
 const SCALE_DIRECTIVE_PAYLOAD_REGEX = /^(\d+(?:\.\d+)?)\s*%$/;
-
-const SLIDE_DIRECTIVE_RULES: SlideDirectiveRule[] = [
-	{
-		parse: (payload) => {
-			const normalizedPayload = payload
-				.trim()
-				.replace(/\s+/g, ' ');
-			if (!normalizedPayload) {
-				return null;
-			}
-
-			const scaleMatch = SCALE_DIRECTIVE_PAYLOAD_REGEX.exec(normalizedPayload);
-			if (!scaleMatch) {
-				return null;
-			}
-
-			const percentToken = scaleMatch[1];
-			if (!percentToken) {
-				return null;
-			}
-
-			const parsedPercent = Number.parseFloat(percentToken);
-			if (!Number.isFinite(parsedPercent) || parsedPercent <= 0) {
-				return null;
-			}
-
-			return parsedPercent;
-		},
-		apply: (scalePercent, directives) => {
-			directives.scaleMultiplier = clampScaleMultiplier(scalePercent / 100);
-		},
-	},
-];
 
 export function parseSlides(markdown: string, separator: string): SlideSegment[] {
 	const { body, startLineOffset } = stripFrontmatter(markdown);
@@ -142,6 +114,10 @@ function createSlideSegment(
 		firstHeadingLevel,
 		layout: classifySlideLayout(firstHeadingLevel),
 		scaleMultiplier: directives.scaleMultiplier,
+		metadata: {
+			theme: directives.theme,
+			speakerNotes: [...directives.speakerNotes],
+		},
 	};
 }
 
@@ -189,16 +165,53 @@ function parseLeadingDirectives(content: string): ParsedLeadingDirectives {
 }
 
 function applyDirectivePayload(payload: string, directives: SlideDirectives): void {
+	const statements = payload
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0);
 
-	for (const rule of SLIDE_DIRECTIVE_RULES) {
-		const parsedValue = rule.parse(payload);
-		if (parsedValue === null) {
-			continue;
-		}
-
-		rule.apply(parsedValue, directives);
-		break;
+	for (const statement of statements) {
+		applyDirectiveStatement(statement, directives);
 	}
+}
+
+function applyDirectiveStatement(statement: string, directives: SlideDirectives): void {
+	const normalizedStatement = statement.replace(/\s+/g, ' ');
+	const scaleMatch = SCALE_DIRECTIVE_PAYLOAD_REGEX.exec(normalizedStatement);
+	const percentToken = scaleMatch?.[1];
+	if (percentToken) {
+		const parsedPercent = Number.parseFloat(percentToken);
+		if (Number.isFinite(parsedPercent) && parsedPercent > 0) {
+			directives.scaleMultiplier = clampScaleMultiplier(parsedPercent / 100);
+		}
+		return;
+	}
+
+	const themeMatch = /^theme\s*:\s*(.+)$/i.exec(statement);
+	if (themeMatch?.[1]) {
+		const normalizedTheme = normalizeDirectiveTheme(themeMatch[1]);
+		if (normalizedTheme) {
+			directives.theme = normalizedTheme;
+		}
+		return;
+	}
+
+	const noteMatch = /^note\s*:\s*(.+)$/i.exec(statement);
+	if (noteMatch?.[1]) {
+		const note = noteMatch[1].trim();
+		if (note) {
+			directives.speakerNotes.push(note);
+		}
+	}
+}
+
+function normalizeDirectiveTheme(rawTheme: string): string | null {
+	const normalized = rawTheme
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, '-')
+		.replace(/[^a-z0-9_-]/g, '');
+	return normalized || null;
 }
 
 function parseLeadingCommentBlock(

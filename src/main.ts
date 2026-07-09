@@ -98,11 +98,6 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 			window.clearTimeout(this.pendingCursorSyncTimer);
 			this.pendingCursorSyncTimer = null;
 		}
-		for (const leaf of this.app.workspace.getLeavesOfType(
-			VIEW_TYPE_SLIDES_PREVIEW,
-		)) {
-			leaf.detach();
-		}
 	}
 
 	async loadSettings() {
@@ -119,6 +114,25 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 		this.settings = {
 			...loaded,
 			...normalizedLayoutKnobs,
+			enablePeriodicRefresh: Boolean(loaded.enablePeriodicRefresh),
+			periodicRefreshIntervalMs: normalizeIntegerInRange(
+				loaded.periodicRefreshIntervalMs,
+				DEFAULT_SETTINGS.periodicRefreshIntervalMs,
+				250,
+				5000,
+			),
+			resizeSettleRefreshCount: normalizeIntegerInRange(
+				loaded.resizeSettleRefreshCount,
+				DEFAULT_SETTINGS.resizeSettleRefreshCount,
+				0,
+				8,
+			),
+			resizeSettleRefreshIntervalMs: normalizeIntegerInRange(
+				loaded.resizeSettleRefreshIntervalMs,
+				DEFAULT_SETTINGS.resizeSettleRefreshIntervalMs,
+				40,
+				1200,
+			),
 		};
 	}
 
@@ -227,4 +241,18 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 	): file is TFile {
 		return file instanceof TFile && file.extension === 'md';
 	}
+}
+
+function normalizeIntegerInRange(
+	value: number | undefined,
+	fallback: number,
+	min: number,
+	max: number,
+): number {
+	if (!Number.isFinite(value)) {
+		return fallback;
+	}
+
+	const safeValue = value as number;
+	return Math.min(max, Math.max(min, Math.round(safeValue)));
 }
