@@ -66,17 +66,21 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 					return;
 				}
 
-				const cursorLine = editor.getCursor().line;
-				if (this.pendingCursorSyncTimer !== null) {
-					window.clearTimeout(this.pendingCursorSyncTimer);
-				}
-
-				this.pendingCursorSyncTimer = window.setTimeout(() => {
-					this.pendingCursorSyncTimer = null;
-					void this.updatePreviewSourceForFile(file, editor.getValue(), cursorLine);
-				}, 140);
+				this.queuePreviewSync(file, editor.getValue(), editor.getCursor().line);
 			}),
 		);
+
+		this.registerDomEvent(document, 'selectionchange', () => {
+			this.queueActiveCursorSync();
+		});
+
+		this.registerDomEvent(document, 'mouseup', () => {
+			this.queueActiveCursorSync();
+		});
+
+		this.registerDomEvent(window, 'keyup', () => {
+			this.queueActiveCursorSync();
+		});
 
 		this.registerEvent(
 			this.app.vault.on('modify', (file) => {
@@ -209,6 +213,30 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 
 			await view.setSource(file, markdown, cursorLine, null);
 		}));
+	}
+
+	private queueActiveCursorSync() {
+		const context = this.getActiveMarkdownContext();
+		if (!context) {
+			return;
+		}
+
+		this.queuePreviewSync(context.file, context.markdown, context.cursorLine);
+	}
+
+	private queuePreviewSync(
+		file: TFile,
+		markdown: string,
+		cursorLine: number,
+	) {
+		if (this.pendingCursorSyncTimer !== null) {
+			window.clearTimeout(this.pendingCursorSyncTimer);
+		}
+
+		this.pendingCursorSyncTimer = window.setTimeout(() => {
+			this.pendingCursorSyncTimer = null;
+			void this.updatePreviewSourceForFile(file, markdown, cursorLine);
+		}, 140);
 	}
 
 	private async refreshAllPreviews(): Promise<void> {
