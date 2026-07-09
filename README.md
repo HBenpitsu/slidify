@@ -1,16 +1,20 @@
 # Slidify
 
 Slidify is a live slide workspace for Obsidian Markdown.
-It keeps authoring and presenting in one flow: write in your note, browse slides in a preview stack, then go fullscreen instantly.
+It keeps authoring and presenting in one flow: write in your note with Obsidian's document look, browse slides in a preview stack, then go fullscreen instantly.
+
+| Editor + preview workspace | Presentation mode |
+| --- | --- |
+| ![Slidify workspace with Markdown editor and live preview](assets/screenshot1.png) | ![Slidify presentation slide with controls](assets/screenshot2.png) |
 
 ## User Guide
 
 ### Why Slidify
 
-- Live while typing: slide preview stays in sync with editor content and cursor position.
-- One visual language: preview cards and presentation stage share the same rendering pipeline.
-- Presentation-ready controls: keyboard navigation, wheel paging in fullscreen, and content zoom with percentage display.
-- Markdown-first: no custom file format, no export step required to present.
+- Obsidian-native look: what you edit is what you present.
+- Live structure feedback while writing, not after finishing.
+- Go from drafting to fullscreen presentation in one click.
+- Cursor-synced active slide keeps edit/preview loops fast.
 
 ### Core workflow
 
@@ -18,19 +22,6 @@ It keeps authoring and presenting in one flow: write in your note, browse slides
 2. Run **Open preview pane**.
 3. Edit as usual; the active slide follows your cursor.
 4. Run **Toggle presentation mode** when you are ready.
-
-### Restart persistence
-
-On Obsidian restart/workspace restore, each Slidify pane restores its last state independently:
-
-- Target Markdown file path
-- Active slide index
-- Content zoom value
-
-Notes:
-
-- Fullscreen presentation state is not restored.
-- If the previously opened file no longer exists, the pane falls back to the empty state.
 
 ### Commands
 
