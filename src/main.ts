@@ -16,9 +16,15 @@ import {
 	VIEW_TYPE_SLIDES_PREVIEW,
 } from './slidesPreviewView';
 
+interface ActiveMarkdownContext {
+	file: TFile;
+	markdown: string;
+	cursorLine: number;
+	sourceLeaf: WorkspaceLeaf;
+}
+
 export default class SlidesLivePreviewPlugin extends Plugin {
 	settings!: SlidesPreviewSettings;
-	private lastSyncedCursorSignature: string | null = null;
 	private pendingCursorSyncTimer: number | null = null;
 
 	async onload() {
@@ -41,7 +47,7 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 			id: 'refresh-slides-live-preview-pane',
 			name: 'Refresh preview pane',
 			callback: () => {
-				void this.syncPreviewWithActiveContext();
+				void this.refreshAllPreviews();
 			},
 		});
 
@@ -54,12 +60,6 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 		});
 
 		this.registerEvent(
-			this.app.workspace.on('file-open', () => {
-				void this.syncPreviewWithActiveContext();
-			}),
-		);
-
-		this.registerEvent(
 			this.app.workspace.on('editor-change', (editor, info) => {
 				const file = info.file;
 				if (!this.isMarkdownFile(file)) {
@@ -67,23 +67,15 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 				}
 
 				const cursorLine = editor.getCursor().line;
-				const signature = `${file.path}:${cursorLine}`;
-				this.lastSyncedCursorSignature = signature;
 				if (this.pendingCursorSyncTimer !== null) {
 					window.clearTimeout(this.pendingCursorSyncTimer);
 				}
 
 				this.pendingCursorSyncTimer = window.setTimeout(() => {
 					this.pendingCursorSyncTimer = null;
-					void this.updatePreviewSource(file, editor.getValue(), cursorLine);
+					void this.updatePreviewSourceForFile(file, editor.getValue(), cursorLine);
 				}, 140);
 			}),
-		);
-
-		this.registerInterval(
-			window.setInterval(() => {
-				void this.syncCursorWithActiveContext();
-			}, 180),
 		);
 
 		this.registerEvent(
@@ -99,10 +91,6 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 		);
 
 		this.addSettingTab(new SlidesPreviewSettingTab(this.app, this));
-
-		this.app.workspace.onLayoutReady(() => {
-			void this.syncPreviewWithActiveContext();
-		});
 	}
 
 	onunload() {
@@ -139,10 +127,11 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 	}
 
 	async refreshPreviewFromActiveContext() {
-		await this.syncPreviewWithActiveContext();
+		await this.refreshAllPreviews();
 	}
 
 	private async activatePreviewPane() {
+		const sourceContext = this.getActiveMarkdownContext();
 		const existingLeaf =
 			this.app.workspace.getLeavesOfType(VIEW_TYPE_SLIDES_PREVIEW)[0];
 		const leaf = existingLeaf ?? this.createPreviewLeaf();
@@ -152,65 +141,64 @@ export default class SlidesLivePreviewPlugin extends Plugin {
 			active: true,
 		});
 		this.app.workspace.setActiveLeaf(leaf, { focus: true });
-		await this.syncPreviewWithActiveContext();
+
+		const view = leaf.view;
+		if (!(view instanceof SlidesPreviewView)) {
+			return;
+		}
+
+		if (sourceContext) {
+			await view.setSource(
+				sourceContext.file,
+				sourceContext.markdown,
+				sourceContext.cursorLine,
+				sourceContext.sourceLeaf,
+			);
+			return;
+		}
+
+		const activeFile = this.app.workspace.getActiveFile();
+		await view.setSource(this.isMarkdownFile(activeFile) ? activeFile : null, null, null, null);
 	}
 
 	private createPreviewLeaf(): WorkspaceLeaf {
 		return this.app.workspace.getLeaf('split', 'vertical');
 	}
 
-	private async syncPreviewWithActiveContext() {
+	private getActiveMarkdownContext(): ActiveMarkdownContext | null {
 		const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (this.isMarkdownFile(markdownView?.file)) {
-			const cursorLine = markdownView.editor.getCursor().line;
-			this.lastSyncedCursorSignature = `${markdownView.file.path}:${cursorLine}`;
-			await this.updatePreviewSource(
-				markdownView.file,
-				markdownView.editor.getValue(),
-				cursorLine,
-			);
-			return;
+		if (!this.isMarkdownFile(markdownView?.file) || !markdownView.leaf) {
+			return null;
 		}
 
-		const activeFile = this.app.workspace.getActiveFile();
-		this.lastSyncedCursorSignature = this.isMarkdownFile(activeFile)
-			? `${activeFile.path}:no-editor`
-			: null;
-		await this.updatePreviewSource(
-			this.isMarkdownFile(activeFile) ? activeFile : null,
-			null,
-			null,
-		);
+		return {
+			file: markdownView.file,
+			markdown: markdownView.editor.getValue(),
+			cursorLine: markdownView.editor.getCursor().line,
+			sourceLeaf: markdownView.leaf,
+		};
 	}
 
-	private async updatePreviewSource(
+	private async updatePreviewSourceForFile(
 		file: TFile | null,
 		markdown: string | null,
 		cursorLine: number | null,
 	) {
-		await Promise.all(
-			this.getPreviewViews().map((view) => view.setSource(file, markdown, cursorLine)),
-		);
+		if (!file) {
+			return;
+		}
+
+		await Promise.all(this.getPreviewViews().map(async (view) => {
+			if (!view.isTargetFile(file.path)) {
+				return;
+			}
+
+			await view.setSource(file, markdown, cursorLine, null);
+		}));
 	}
 
-	private async syncCursorWithActiveContext() {
-		const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-		if (!this.isMarkdownFile(markdownView?.file)) {
-			return;
-		}
-
-		const cursorLine = markdownView.editor.getCursor().line;
-		const signature = `${markdownView.file.path}:${cursorLine}`;
-		if (signature === this.lastSyncedCursorSignature) {
-			return;
-		}
-
-		this.lastSyncedCursorSignature = signature;
-		await this.updatePreviewSource(
-			markdownView.file,
-			markdownView.editor.getValue(),
-			cursorLine,
-		);
+	private async refreshAllPreviews(): Promise<void> {
+		await Promise.all(this.getPreviewViews().map((view) => view.refreshPinnedSource()));
 	}
 
 	private async togglePresentationMode() {

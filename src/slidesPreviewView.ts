@@ -1,4 +1,4 @@
-import { Component, ItemView, MarkdownRenderer, TFile, WorkspaceLeaf } from 'obsidian';
+import { Component, ItemView, MarkdownRenderer, MarkdownView, TFile, WorkspaceLeaf } from 'obsidian';
 import SlidesLivePreviewPlugin from './main';
 import { findSlideIndexForLine, parseSlides, type SlideSegment } from './slideModel';
 import {
@@ -11,6 +11,8 @@ export const VIEW_TYPE_SLIDES_PREVIEW = 'slides-live-preview';
 const CONTENT_SCALE_FACTOR = 1.1;
 const CONTENT_SCALE_DEFAULT = 1;
 const PREVIEW_OVERFLOW_SAFETY_PX = 12;
+const NON_ACTIVE_BATCH_REFRESH_MS = 420;
+const PREVIEW_RENDER_CHUNK_BUDGET_MS = 8;
 
 type IconName =
 	| 'previous'
@@ -63,6 +65,7 @@ interface SlideLayoutMeasurements {
 export class SlidesPreviewView extends ItemView {
 	private plugin: SlidesLivePreviewPlugin;
 	private targetFile: TFile | null = null;
+	private targetLeaf: WorkspaceLeaf | null = null;
 	private liveMarkdown: string | null = null;
 	private currentCursorLine: number | null = null;
 	private slidesRootEl: HTMLDivElement | null = null;
@@ -91,6 +94,7 @@ export class SlidesPreviewView extends ItemView {
 	private lastRenderedSlides: SlideSegment[] = [];
 	private previewStackEl: HTMLDivElement | null = null;
 	private presentationStageEl: HTMLDivElement | null = null;
+	private pendingNonActiveBatchRefreshTimer: number | null = null;
 
 	constructor(leaf: WorkspaceLeaf, plugin: SlidesLivePreviewPlugin) {
 		super(leaf);
@@ -121,6 +125,7 @@ export class SlidesPreviewView extends ItemView {
 	}
 
 	async onClose(): Promise<void> {
+		this.cancelScheduledNonActiveBatchRefresh();
 		this.teardownRenderComponent();
 		this.paneResizeObserver?.disconnect();
 		this.paneResizeObserver = null;
@@ -133,11 +138,35 @@ export class SlidesPreviewView extends ItemView {
 		file: TFile | null,
 		markdown: string | null,
 		cursorLine: number | null = null,
+		sourceLeaf: WorkspaceLeaf | null = null,
 	): Promise<void> {
 		const nextPath = this.isMarkdownFile(file) ? file.path : null;
 		this.targetFile = this.isMarkdownFile(file) ? file : null;
+		if (!this.targetFile) {
+			this.targetLeaf = null;
+		}
+		if (sourceLeaf) {
+			this.targetLeaf = sourceLeaf;
+		}
 		this.liveMarkdown = markdown;
 		this.currentCursorLine = cursorLine;
+
+		if (
+			nextPath &&
+			nextPath === this.lastRenderedFilePath &&
+			markdown !== null &&
+			markdown !== this.lastRenderedMarkdown &&
+			cursorLine !== null
+		) {
+			const updatedActiveOnly = await this.tryApplyActiveSlideLiveUpdate(
+				markdown,
+				cursorLine,
+			);
+			if (updatedActiveOnly) {
+				this.scheduleNonActiveBatchRefresh();
+				return;
+			}
+		}
 
 		if (
 			nextPath &&
@@ -151,6 +180,14 @@ export class SlidesPreviewView extends ItemView {
 		}
 
 		this.updateRevealState(cursorLine);
+		await this.refresh();
+	}
+
+	isTargetFile(path: string): boolean {
+		return this.targetFile?.path === path;
+	}
+
+	async refreshPinnedSource(): Promise<void> {
 		await this.refresh();
 	}
 
@@ -271,23 +308,42 @@ export class SlidesPreviewView extends ItemView {
 		const stackEl = this.ensurePreviewStack();
 		const staleCards = Array.from(stackEl.children);
 		let activeSlideEl: HTMLDivElement | null = null;
+		let chunkStartTime = performance.now();
 
 		for (const [index, slide] of slides.entries()) {
 			if (currentVersion !== this.renderVersion) {
 				return;
 			}
 
-			const previewSlide = this.createPreviewSlideElement(index);
-			const { slideEl, overflowGuideEl, surfaceEl, zoomFrameEl, zoomContentEl, slideContentEl } =
-				previewSlide;
-			const staleCard = staleCards[index];
-			if (staleCard instanceof HTMLDivElement) {
-				stackEl.replaceChild(slideEl, staleCard);
-			} else {
-				stackEl.appendChild(slideEl);
+			if (performance.now() - chunkStartTime > PREVIEW_RENDER_CHUNK_BUDGET_MS) {
+				const canContinue = await this.waitForLayoutFrame(currentVersion);
+				if (!canContinue) {
+					return;
+				}
+				chunkStartTime = performance.now();
 			}
 
-			await this.renderSlideMarkdown(slide, slideContentEl, sourcePath);
+			const slideSignature = this.computeSlideRenderSignature(slide);
+			const staleCard = staleCards[index];
+			const previewSlide = this.resolvePreviewSlideForRender({
+				index,
+				slide,
+				slideSignature,
+				stackEl,
+				staleCard,
+			});
+			const {
+				slideEl,
+				overflowGuideEl,
+				surfaceEl,
+				zoomFrameEl,
+				zoomContentEl,
+				slideContentEl,
+				needsMarkdownRender,
+			} = previewSlide;
+			if (needsMarkdownRender) {
+				await this.renderSlideMarkdown(slide, slideContentEl, sourcePath);
+			}
 			const laidOut = await this.resolveAndApplySlideLayout({
 				mode: 'preview',
 				slide,
@@ -303,6 +359,8 @@ export class SlidesPreviewView extends ItemView {
 				return;
 			}
 
+			slideEl.toggleClass('is-active', index === this.currentSlideIndex);
+			this.updateSlideSourceMetadata(slideEl, slide);
 			if (index === this.currentSlideIndex) {
 				activeSlideEl = slideEl;
 			}
@@ -347,7 +405,17 @@ export class SlidesPreviewView extends ItemView {
 		stageEl.empty();
 		const { surfaceEl, zoomFrameEl, zoomContentEl, slideContentEl } =
 			this.createSlideSurface(stageEl, 'slides-live-preview-presentation-surface');
+		surfaceEl.addEventListener('click', (event: MouseEvent) => {
+			if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey) {
+				return;
+			}
+
+			event.preventDefault();
+			const sourceLine = this.resolveSourceLineFromPresentationClick(event.target, activeSlide);
+			void this.focusSourceEditorAtLine(sourceLine);
+		});
 		await this.renderSlideMarkdown(activeSlide, slideContentEl, sourcePath);
+		this.assignApproximateSourceLines(slideContentEl, activeSlide);
 		const laidOut = await this.resolveAndApplySlideLayout({
 			mode: 'presentation',
 			slide: activeSlide,
@@ -402,6 +470,9 @@ export class SlidesPreviewView extends ItemView {
 		slideEl.addEventListener('mouseenter', () => {
 			this.selectSlideInPreview(slideIndex);
 		});
+		slideEl.addEventListener('click', (event) => {
+			void this.handlePreviewSlideClick(event, slideIndex, slideEl);
+		});
 
 		const overflowGuideEl = slideEl.createDiv({ cls: 'slides-live-preview-overflow-guide' });
 		const { surfaceEl, zoomFrameEl, zoomContentEl, slideContentEl } =
@@ -417,6 +488,294 @@ export class SlidesPreviewView extends ItemView {
 			zoomContentEl,
 			slideContentEl,
 		};
+	}
+
+	private resolvePreviewSlideForRender(args: {
+		index: number;
+		slide: SlideSegment;
+		slideSignature: string;
+		stackEl: HTMLDivElement;
+		staleCard: Element | undefined;
+	}): PreviewSlideElements & { needsMarkdownRender: boolean } {
+		const existingSlide =
+			args.staleCard instanceof HTMLDivElement
+				? this.getPreviewSlideElementsFromExisting(args.staleCard)
+				: null;
+
+		if (
+			existingSlide &&
+			existingSlide.slideEl.getAttribute('data-slide-signature') === args.slideSignature
+		) {
+			existingSlide.slideEl.setAttribute('data-slide-index', String(args.index));
+			return {
+				...existingSlide,
+				needsMarkdownRender: false,
+			};
+		}
+
+		const nextSlide = this.createPreviewSlideElement(args.index);
+		nextSlide.slideEl.setAttribute('data-slide-signature', args.slideSignature);
+		if (args.staleCard instanceof HTMLDivElement) {
+			args.stackEl.replaceChild(nextSlide.slideEl, args.staleCard);
+		} else {
+			args.stackEl.appendChild(nextSlide.slideEl);
+		}
+
+		return {
+			...nextSlide,
+			needsMarkdownRender: true,
+		};
+	}
+
+	private getPreviewSlideElementsFromExisting(
+		slideEl: HTMLDivElement,
+	): PreviewSlideElements | null {
+		const overflowGuideEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-overflow-guide',
+		);
+		const surfaceEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-preview-surface',
+		);
+		const zoomFrameEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-zoom-frame',
+		);
+		const zoomContentEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-zoom-content',
+		);
+		const slideContentEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-slide-content',
+		);
+
+		if (!overflowGuideEl || !surfaceEl || !zoomFrameEl || !zoomContentEl || !slideContentEl) {
+			return null;
+		}
+
+		return {
+			slideEl,
+			overflowGuideEl,
+			surfaceEl,
+			zoomFrameEl,
+			zoomContentEl,
+			slideContentEl,
+		};
+	}
+
+	private computeSlideRenderSignature(slide: SlideSegment): string {
+		const contentHash = this.hashString(slide.content);
+		return `${slide.layout}|${slide.scaleMultiplier}|${contentHash}`;
+	}
+
+	private hashString(content: string): string {
+		let hash = 2166136261;
+		for (let index = 0; index < content.length; index += 1) {
+			hash ^= content.charCodeAt(index);
+			hash +=
+				(hash << 1) +
+				(hash << 4) +
+				(hash << 7) +
+				(hash << 8) +
+				(hash << 24);
+		}
+
+		return (hash >>> 0).toString(36);
+	}
+
+	private updateSlideSourceMetadata(slideEl: HTMLDivElement, slide: SlideSegment): void {
+		slideEl.setAttribute('data-source-start-line', String(slide.startLine));
+		slideEl.setAttribute('data-source-end-line', String(slide.endLine));
+
+		const slideContentEl = slideEl.querySelector<HTMLDivElement>(
+			'.slides-live-preview-slide-content',
+		);
+		if (!slideContentEl) {
+			return;
+		}
+
+		this.assignApproximateSourceLines(slideContentEl, slide);
+	}
+
+	private assignApproximateSourceLines(
+		slideContentEl: HTMLDivElement,
+		slide: SlideSegment,
+	): void {
+		const lines = slide.content.split(/\r?\n/);
+		const blockElements = Array.from(slideContentEl.children);
+		let lineOffset = 0;
+
+		for (const blockEl of blockElements) {
+			while (lineOffset < lines.length && !lines[lineOffset]?.trim()) {
+				lineOffset += 1;
+			}
+
+			const boundedOffset = Math.min(Math.max(lineOffset, 0), Math.max(lines.length - 1, 0));
+			blockEl.setAttribute('data-source-line', String(slide.startLine + boundedOffset));
+			lineOffset += 1;
+		}
+	}
+
+	private scheduleNonActiveBatchRefresh(): void {
+		this.cancelScheduledNonActiveBatchRefresh();
+
+		this.pendingNonActiveBatchRefreshTimer = window.setTimeout(() => {
+			this.pendingNonActiveBatchRefreshTimer = null;
+			window.requestAnimationFrame(() => {
+				void this.refresh();
+			});
+		}, NON_ACTIVE_BATCH_REFRESH_MS);
+	}
+
+	private cancelScheduledNonActiveBatchRefresh(): void {
+		if (this.pendingNonActiveBatchRefreshTimer !== null) {
+			window.clearTimeout(this.pendingNonActiveBatchRefreshTimer);
+			this.pendingNonActiveBatchRefreshTimer = null;
+		}
+	}
+
+	private async tryApplyActiveSlideLiveUpdate(
+		markdown: string,
+		cursorLine: number,
+	): Promise<boolean> {
+		if (!this.targetFile || this.isPresenting() || !this.previewStackEl) {
+			return false;
+		}
+
+		const slides = parseSlides(markdown, this.plugin.settings.slideSeparator);
+		if (slides.length === 0) {
+			return false;
+		}
+
+		this.currentCursorLine = cursorLine;
+		this.syncActiveSlideIndex(slides);
+		const activeSlide = slides[this.currentSlideIndex];
+		if (!activeSlide) {
+			return false;
+		}
+
+		const activeSlideEl = this.previewStackEl.querySelector<HTMLDivElement>(
+			`[data-slide-index="${this.currentSlideIndex}"]`,
+		);
+		if (!activeSlideEl) {
+			return false;
+		}
+
+		const previewElements = this.getPreviewSlideElementsFromExisting(activeSlideEl);
+		if (!previewElements) {
+			return false;
+		}
+
+		const nextSignature = this.computeSlideRenderSignature(activeSlide);
+		if (activeSlideEl.getAttribute('data-slide-signature') !== nextSignature) {
+			activeSlideEl.setAttribute('data-slide-signature', nextSignature);
+			await this.renderSlideMarkdown(activeSlide, previewElements.slideContentEl, this.targetFile.path);
+		}
+
+		const laidOut = await this.resolveAndApplySlideLayout({
+			mode: 'preview',
+			slide: activeSlide,
+			surfaceEl: previewElements.surfaceEl,
+			zoomFrameEl: previewElements.zoomFrameEl,
+			zoomContentEl: previewElements.zoomContentEl,
+			slideContentEl: previewElements.slideContentEl,
+			slideEl: previewElements.slideEl,
+			overflowGuideEl: previewElements.overflowGuideEl,
+			currentVersion: this.renderVersion,
+		});
+		if (!laidOut) {
+			return false;
+		}
+
+		this.updateSlideSourceMetadata(previewElements.slideEl, activeSlide);
+		this.lastRenderedSlides = slides;
+		this.lastRenderedMarkdown = markdown;
+		this.lastRenderedFilePath = this.targetFile.path;
+		this.revealActiveSlideOnRefresh = true;
+		this.revealActiveSlideInPreview(previewElements.slideEl, this.renderVersion);
+		this.updatePager(slides.length);
+		return true;
+	}
+
+	private async handlePreviewSlideClick(
+		event: MouseEvent,
+		slideIndex: number,
+		slideEl: HTMLDivElement,
+	): Promise<void> {
+		if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey) {
+			return;
+		}
+
+		event.preventDefault();
+		this.selectSlideInPreview(slideIndex);
+		const sourceLine = this.resolveSourceLineFromClickTarget(event.target, slideEl);
+		await this.focusSourceEditorAtLine(sourceLine);
+	}
+
+	private resolveSourceLineFromClickTarget(
+		target: EventTarget | null,
+		slideEl: HTMLDivElement,
+	): number {
+		if (target instanceof HTMLElement) {
+			const lineHintEl = target.closest<HTMLElement>('[data-source-line]');
+			const hintedLine = lineHintEl?.getAttribute('data-source-line');
+			const parsedHint = hintedLine ? Number.parseInt(hintedLine, 10) : Number.NaN;
+			if (Number.isFinite(parsedHint) && parsedHint >= 0) {
+				return parsedHint;
+			}
+		}
+
+		const fallbackLineToken = slideEl.getAttribute('data-source-start-line');
+		const fallbackLine = fallbackLineToken ? Number.parseInt(fallbackLineToken, 10) : Number.NaN;
+		return Number.isFinite(fallbackLine) && fallbackLine >= 0 ? fallbackLine : 0;
+	}
+
+	private resolveTargetLeaf(): WorkspaceLeaf | null {
+		if (this.targetLeaf && this.app.workspace.getLeavesOfType('markdown').includes(this.targetLeaf)) {
+			return this.targetLeaf;
+		}
+
+		if (!this.targetFile) {
+			return null;
+		}
+
+		const markdownLeaf = this.app.workspace
+			.getLeavesOfType('markdown')
+			.find((leaf) => {
+				const markdownView = leaf.view;
+				return markdownView instanceof MarkdownView && markdownView.file?.path === this.targetFile?.path;
+			});
+		if (markdownLeaf) {
+			this.targetLeaf = markdownLeaf;
+			return markdownLeaf;
+		}
+
+		return null;
+	}
+
+	private async focusSourceEditorAtLine(line: number): Promise<void> {
+		const targetLeaf = this.resolveTargetLeaf();
+		if (!targetLeaf || !this.targetFile) {
+			return;
+		}
+
+		const currentView = targetLeaf.view;
+		if (!(currentView instanceof MarkdownView) || currentView.file?.path !== this.targetFile.path) {
+			await targetLeaf.openFile(this.targetFile, { active: false });
+		}
+
+		const markdownView = targetLeaf.view;
+		if (!(markdownView instanceof MarkdownView)) {
+			return;
+		}
+
+		const safeLine = Math.max(0, Math.floor(line));
+		this.app.workspace.setActiveLeaf(targetLeaf, { focus: true });
+		markdownView.editor.setCursor({ line: safeLine, ch: 0 });
+		markdownView.editor.scrollIntoView(
+			{
+				from: { line: safeLine, ch: 0 },
+				to: { line: safeLine, ch: 0 },
+			},
+			true,
+		);
 	}
 
 	private renderOverlay(isPresenting: boolean, slideCount = this.lastSlideCount): void {
@@ -707,6 +1066,7 @@ export class SlidesPreviewView extends ItemView {
 		slideContentEl: HTMLDivElement,
 		sourcePath: string,
 	): Promise<void> {
+		slideContentEl.empty();
 		await MarkdownRenderer.render(
 			this.app,
 			slide.content,
@@ -717,12 +1077,30 @@ export class SlidesPreviewView extends ItemView {
 		this.applySlideLayout(slideContentEl, slide);
 	}
 
+	private resolveSourceLineFromPresentationClick(
+		target: EventTarget | null,
+		slide: SlideSegment,
+	): number {
+		if (target instanceof HTMLElement) {
+			const lineHintEl = target.closest<HTMLElement>('[data-source-line]');
+			const hintedLine = lineHintEl?.getAttribute('data-source-line');
+			const parsedHint = hintedLine ? Number.parseInt(hintedLine, 10) : Number.NaN;
+			if (Number.isFinite(parsedHint) && parsedHint >= 0) {
+				return parsedHint;
+			}
+		}
+
+		return Math.max(0, slide.startLine);
+	}
+
 	private createSlideSurface(parentEl: HTMLElement, cls: string): SlideSurfaceElements {
 		const surfaceEl = parentEl.createDiv({ cls });
 		const zoomFrameEl = surfaceEl.createDiv({ cls: 'slides-live-preview-zoom-frame' });
 		const zoomContentEl = zoomFrameEl.createDiv({ cls: 'slides-live-preview-zoom-content' });
 		zoomContentEl.addClass('is-layout-pending');
 		const slideContentEl = zoomContentEl.createDiv({ cls: 'slides-live-preview-slide-content' });
+		slideContentEl.addClass('markdown-preview-view');
+		slideContentEl.addClass('markdown-rendered');
 		return {
 			surfaceEl,
 			zoomFrameEl,
