@@ -23,6 +23,40 @@ It keeps authoring and presenting in one flow: write in your note with Obsidian'
 3. Edit as usual; the active slide follows your cursor.
 4. Run **Toggle presentation mode** when you are ready.
 
+### Available interactions
+
+#### Preview pane
+
+| Action | Result |
+| --- | --- |
+| Click a slide | Selects that slide and moves the editor cursor to the corresponding line |
+| `→` / `Page Down` | Next slide |
+| `←` / `Page Up` | Previous slide |
+| `F` | Toggle presentation mode |
+| `Ctrl` + scroll up | Zoom in slide content |
+| `Ctrl` + scroll down | Zoom out slide content |
+
+#### Presentation mode
+
+| Action | Result |
+| --- | --- |
+| `→` / `Page Down` | Next slide |
+| `←` / `Page Up` | Previous slide |
+| `F` | Exit presentation mode |
+| Scroll down | Next slide |
+| Scroll up | Previous slide |
+| `Ctrl` + scroll | Zoom slide content |
+| Click on slide content | Jump the editor cursor to the clicked line |
+
+#### Overlay controls
+
+| Control | Result |
+| --- | --- |
+| **Previous** / **Next** buttons | Navigate one slide at a time |
+| **−** / **%** / **+** zoom buttons | Zoom out / reset zoom / zoom in slide content |
+| **Present** button | toggle preview/presentation mode |
+| **Dock** button | Toggle control bar position between left and right |
+
 ### Commands
 
 - `Open preview pane`
